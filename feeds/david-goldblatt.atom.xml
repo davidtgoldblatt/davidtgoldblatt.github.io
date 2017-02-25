@@ -1,0 +1,1205 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>David Goldblatt's website - David Goldblatt</title><link href="http://dgoldblatt.com/" rel="alternate"></link><link href="http://dgoldblatt.com/feeds/david-goldblatt.atom.xml" rel="self"></link><id>http://dgoldblatt.com/</id><updated>2015-06-30T15:20:00-07:00</updated><entry><title>A threading riddle - Solution</title><link href="http://dgoldblatt.com/a-threading-riddle-solution.html" rel="alternate"></link><published>2015-06-30T15:20:00-07:00</published><updated>2015-06-30T15:20:00-07:00</updated><author><name>David Goldblatt</name></author><id>tag:dgoldblatt.com,2015-06-30:/a-threading-riddle-solution.html</id><summary type="html">&lt;p&gt;A solution to the threading riddle from the previous post&lt;/p&gt;</summary><content type="html">&lt;h1&gt;Introduction&lt;/h1&gt;
+&lt;p&gt;In &lt;a href="http://dgoldblatt.com/a-threading-riddle.html"&gt;the last post&lt;/a&gt;, we looked at a threading problem
+that requires a some trickiness to solve. In this post, we'll reveal the tricks
+that we need.&lt;/p&gt;
+&lt;p&gt;As a recap, we had two functions we set out to implement, that operate on an
+array of size &lt;code&gt;N&lt;/code&gt;.&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;code&gt;void modify(size_t index, int value);&lt;/code&gt; This changes the element at position
+  &lt;code&gt;index&lt;/code&gt; to equal &lt;code&gt;value&lt;/code&gt;.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;code&gt;void wait_until_equal(size_t index1, size_t index2);&lt;/code&gt; This blocks until the
+  elements at positions &lt;code&gt;index1&lt;/code&gt; and &lt;code&gt;index2&lt;/code&gt; of the array are equal.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;We wanted to see how to implement these functions.&lt;/p&gt;
+&lt;p&gt;As always, I've thought about this code, but haven't tested it. Given the tricky
+nature of concurrency problems, there's almost certainly bugs, errors, and
+performance gotchas. Think and test carefully before using.&lt;/p&gt;
+&lt;h1&gt;Initial data structures&lt;/h1&gt;
+&lt;p&gt;Let's start out by looking at the variables required by the problem.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;num_elements&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;...;&lt;/span&gt;
+
+&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_elements&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;modify&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;wait_until_equal&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;We want operations on different array indices to acquire different locks, in
+order to allow for as much parallelism as is possible. To accomplish this, let's
+have a per-element lock; &lt;code&gt;mu[i]&lt;/code&gt; guards modifications to &lt;code&gt;array[i]&lt;/code&gt;.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt; &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_elements&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h1&gt;Inspiration&lt;/h1&gt;
+&lt;p&gt;With our fundamental data definitions out of the way, we can talk about how to
+solve the problem. To do this, let's look at how we would solve a simpler
+problem. Suppose instead of &lt;code&gt;void wait_until_equal(size_t index1, size_t
+index2)&lt;/code&gt;, we had &lt;code&gt;void wait_until_zero(size_t index)&lt;/code&gt;, which waits until
+&lt;code&gt;arr[index]&lt;/code&gt; is &lt;code&gt;0&lt;/code&gt;. Then the problem is easy: we have a condition variable per
+array element, which gets notified on changes to the element. Then we could
+implement the functionality as follows:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;condition_variable&lt;/span&gt; &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_elements&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;modify&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+  &lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;notify_all&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;wait_until_zero&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;unique_lock&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu_index&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;!=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h1&gt;An abstraction -- MultiConditionVariable&lt;/h1&gt;
+&lt;p&gt;Inspired by &lt;code&gt;wait_until_zero&lt;/code&gt;, we might see a solution: if we had a &lt;code&gt;wait&lt;/code&gt; that
+could wait on multiple conditions simultaneously, then, in &lt;code&gt;wait_until_equal&lt;/code&gt;,
+we could wait for a notification on the condition associated with either of the
+indices we're interested in. We want a &lt;code&gt;MultiConditionVariable&lt;/code&gt; that allows
+waiting on multiple conditions at once.&lt;/p&gt;
+&lt;p&gt;Let's write out our implementation in terms of this primitive before we see how
+to implement the primitive.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt; &lt;span class="n"&gt;mcv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_elements&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;modify&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+  &lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;mcv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;notify_all&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+
+&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;wait_until_equal&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;size_t&lt;/span&gt; &lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;],&lt;/span&gt; &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+  &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;!=&lt;/span&gt; &lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;])&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mcv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;],&lt;/span&gt; &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;],&lt;/span&gt; &lt;span class="n"&gt;mcv&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;],&lt;/span&gt; &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index1&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+  &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;index2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h1&gt;Implementing MultiConditionVariable&lt;/h1&gt;
+&lt;p&gt;Now, let's see how to implement the &lt;code&gt;MultiConditionVariable&lt;/code&gt; class. First, we'll
+describe its semantics:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;MultiConditionVariable&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="c1"&gt;// Causes the current thread to wait until one of mcv1 or mcv2 is&lt;/span&gt;
+  &lt;span class="c1"&gt;// notified, atomically releasing mu1 and mu2, or a spurious wakeup&lt;/span&gt;
+  &lt;span class="c1"&gt;// occurs. Will reacquire mu1 and mu2 before returning.&lt;/span&gt;
+  &lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mu1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+                   &lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mcv2&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mu2&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// Wakes up all threads which are currently waiting on *this. Note that&lt;/span&gt;
+  &lt;span class="c1"&gt;// such threads will also be waiting on some other MultiConditionVariable&lt;/span&gt;
+  &lt;span class="c1"&gt;// as well.&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;notify_all&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;How should we implement this class? Here's what we know:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;Threads need to go to sleep until woken in &lt;code&gt;wait&lt;/code&gt;; we need a way to enable
+  sleeping/waking.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;code&gt;notify_all&lt;/code&gt; needs to know which threads to wake up; there must be a way of
+  keeping track of the set of threads.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;Because of the previous point, &lt;code&gt;wait&lt;/code&gt; needs to inform the
+  &lt;code&gt;MultiConditionVariable&lt;/code&gt; that it is sleeping on it, so that it can be later
+  notified.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;A Sleeper&lt;/h2&gt;
+&lt;p&gt;The waiting going on is necessarily a little bit tricky; when a thread goes to
+sleep, it can't hold any locks other threads might need to acquire, or else we
+might cause deadlock. But if we don't hold any locks, we might miss the fact
+that the thread should wake up. To fix this, we'll have to use a mutex and a
+condition variable. Let's encapsulate this into a struct:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;Sleeper&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;sleep&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;unique_lock&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;]{&lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;awoken&lt;/span&gt;&lt;span class="p"&gt;;})&lt;/span&gt;
+    &lt;span class="n"&gt;awoken&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;false&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;wake&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;bool&lt;/span&gt; &lt;span class="n"&gt;old_awoken&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;old_awoken&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;awoken&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="n"&gt;awoken&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;true&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="n"&gt;old_awoken&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;notify_one&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;bool&lt;/span&gt; &lt;span class="n"&gt;awoken&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;false&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;condition_variable&lt;/span&gt; &lt;span class="n"&gt;cv&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt; &lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;The way the sleeper works, it can put itself into a list of threads waiting to
+be woken up, release the lock on the list, and then &lt;code&gt;sleep()&lt;/code&gt;. If another thread
+acquires the lock on the list, calls &lt;code&gt;wake()&lt;/code&gt; to wake up the first thread, and
+then continues, then it doesn't matter if the &lt;code&gt;sleep()&lt;/code&gt; or the &lt;code&gt;wake()&lt;/code&gt; happens
+first; the thread that &lt;code&gt;sleep()&lt;/code&gt;s will continue either way.&lt;/p&gt;
+&lt;h2&gt;MultiConditionVariable internals&lt;/h2&gt;
+&lt;p&gt;The &lt;code&gt;MultiConditionVariable&lt;/code&gt; needs to maintain the set of threads that are
+waiting on it. To do this, we'll use an &lt;code&gt;std::unordered_set&lt;/code&gt; of
+pointers-to-&lt;code&gt;Sleeper&lt;/code&gt;. Since this set will be accessed concurrently, we'll add
+an &lt;code&gt;std::mutex&lt;/code&gt; as well to protect it. The call to &lt;code&gt;wait&lt;/code&gt; will create a
+&lt;code&gt;Sleeper&lt;/code&gt; and add it to the passed-in &lt;code&gt;MultiConditionVariable&lt;/code&gt;s before going to
+sleep. Upon awakening, it removes the &lt;code&gt;Sleeper&lt;/code&gt; from the
+&lt;code&gt;MultiConditionVariable&lt;/code&gt;s and returns. A call to &lt;code&gt;notify_all&lt;/code&gt; simply wakes all
+the threads that are contained in the &lt;code&gt;MultiConditionVariable&lt;/code&gt;. Note that races
+in which a thread is added to the &lt;code&gt;MultiConditionVariable&lt;/code&gt; when the
+corresponding element of &lt;code&gt;mu&lt;/code&gt; isn't held is fine; in the worst case, we get a
+spurious wakeup of the added thread, which is allowed by the
+&lt;code&gt;MultiConditionVariable&lt;/code&gt; contract.&lt;/p&gt;
+&lt;p&gt;So, here's &lt;code&gt;MultiConditionVariable&lt;/code&gt; with an implementation:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;MultiConditionVariable&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mu1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+                   &lt;span class="n"&gt;MultiConditionVariable&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mcv2&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;mu2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;Sleeper&lt;/span&gt; &lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;insert&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;mu&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;mcv2&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;insert&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="n"&gt;mu1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;mu2&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+
+    &lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleep&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+
+    &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;erase&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mcv1&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;mcv2&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;erase&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;mu2&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;notify_all&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;lock_guard&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Sleeper&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt; &lt;span class="nl"&gt;sleeper&lt;/span&gt; &lt;span class="p"&gt;:&lt;/span&gt; &lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;sleeper&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;wake&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;clear&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;unordered_set&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;Sleeper&lt;/span&gt;&lt;span class="o"&gt;*&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;sleepers_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;mutex&lt;/span&gt; &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;This gives us the &lt;code&gt;MultiConditionVariable&lt;/code&gt; primitive we need, which completes
+the puzzle.&lt;/p&gt;
+&lt;h2&gt;Some very slight fixes&lt;/h2&gt;
+&lt;p&gt;A particularly eagle-eyed reader might note that we haven't completely satisfied
+the requirements from the previous post. In particular, a call to &lt;code&gt;modify&lt;/code&gt; might
+need to wake a sleeping thread that is being woken by a call to &lt;code&gt;modify&lt;/code&gt; from
+another thread. This involves acquiring a lock on the &lt;code&gt;Sleeper&lt;/code&gt; struct. So, a
+&lt;code&gt;modify&lt;/code&gt; call might wait on another call to &lt;code&gt;modify&lt;/code&gt; if they each try to wake
+the same thread, breaking the rule that calls to one function shouldn't wait on
+calls to another unless they share an index they operate on.&lt;/p&gt;
+&lt;p&gt;We have three avenues to fix this.&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;Most reasonably, we could simply declare that waiting for a lock in Sleeper
+  shouldn't count as blocking. Waiting for the time it takes to modify a boolean
+  and signal a condition variable is hardly waiting at all.  This works unless
+  you need waking to truly avoid waiting for another thread (say, if you're
+  writing signal-safe code), even in corner-cases.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;We could implement &lt;code&gt;Sleeper&lt;/code&gt; without the mutex/condition variable primitive,
+  relying on OS system call functionality like Linux futexes, or the Windows
+  event primitive.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;We could use atomics, and &lt;code&gt;compare_exchange_strong&lt;/code&gt; a boolean in order to
+  allow one thread to "win" a race and become the designated waker of the
+  sleeping thread. Since all but one of multiple racing calls to &lt;code&gt;wake&lt;/code&gt; can
+  safely be ignored (the sleeping thread needs only to be woken once), we can
+  avoid having to acquire a mutex and potentially block.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h1&gt;Conclusion&lt;/h1&gt;
+&lt;p&gt;Just to summarize the steps here: we first implemented &lt;code&gt;modify&lt;/code&gt; and
+&lt;code&gt;wait_until_equal&lt;/code&gt; by reducing them to a primitive &lt;code&gt;MultiConditionVariable&lt;/code&gt;.
+&lt;code&gt;MultiConditionVariable&lt;/code&gt; itself relied on a helper &lt;code&gt;Sleeper&lt;/code&gt; class, which
+enabled us to explicitly control thread sleeping and waking.&lt;/p&gt;
+&lt;p&gt;This problem is trickier than it appears; the extra machinery relative to the
+&lt;code&gt;wait_until_zero&lt;/code&gt; variant is substantial. However, it appears to be necessary; I
+haven't been able to find a solution that is fundamentally different than the
+one presented here. All the simpler solutions I've seen involve "tricks" like
+using Software Transactional Memory, which in turn must be built using a
+primitive not unlike &lt;code&gt;MultiConditionVariable&lt;/code&gt;. If you've discovered a solution
+that is simpler but does not rely on more powerful primitives, I'd love to hear
+about it.&lt;/p&gt;
+&lt;h1&gt;Notes&lt;/h1&gt;
+&lt;p&gt;Waiting for one of several conditions to become true is an old trick. It is
+used, for instance, in the Windows &lt;code&gt;WaitForMultipleObjects&lt;/code&gt; system call. A
+solution that goes down the same paths as this one is used in Unix ports of the
+Windows threading APIs.&lt;/p&gt;
+&lt;p&gt;The &lt;code&gt;Sleeper&lt;/code&gt; class is essentially an implementation of the Java &lt;code&gt;LockSupport&lt;/code&gt;
+class, which is a low-level API to allow thread sleeping and waiting for use in
+locking primitives.&lt;/p&gt;</content><category term="concurrency"></category><category term="multithreading"></category><category term="programming"></category></entry><entry><title>A threading riddle</title><link href="http://dgoldblatt.com/a-threading-riddle.html" rel="alternate"></link><published>2015-06-24T15:20:00-07:00</published><updated>2015-06-24T15:20:00-07:00</updated><author><name>David Goldblatt</name></author><id>tag:dgoldblatt.com,2015-06-24:/a-threading-riddle.html</id><summary type="html">&lt;p&gt;A tricky problem involving threads waiting for complex conditions to become true&lt;/p&gt;</summary><content type="html">&lt;h1&gt;Introduction&lt;/h1&gt;
+&lt;p&gt;The two key primitives used as building blocks for (blocking) concurrent
+algorithms are mutexes and condition variables, showing up in C++ as
+&lt;code&gt;std::mutex&lt;/code&gt; and &lt;code&gt;std::condition_variable&lt;/code&gt;.&lt;/p&gt;
+&lt;p&gt;In this post, I'll describe a pair of functions that can be simply described,
+but whose implementation requires a tricky use of these primitives.&lt;/p&gt;
+&lt;h1&gt;The problem&lt;/h1&gt;
+&lt;p&gt;Suppose we have an array of &lt;code&gt;N&lt;/code&gt; &lt;code&gt;int&lt;/code&gt;s. There are two functions we want to
+implement:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;code&gt;void modify(size_t index, int value);&lt;/code&gt; This changes the element at position
+  &lt;code&gt;index&lt;/code&gt; to equal &lt;code&gt;value&lt;/code&gt;.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;code&gt;void wait_until_equal(size_t index1, size_t index2);&lt;/code&gt; This blocks until the
+  elements at positions &lt;code&gt;index1&lt;/code&gt; and &lt;code&gt;index2&lt;/code&gt; of the array are equal.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;The question is: how do we implement &lt;code&gt;modify&lt;/code&gt; and &lt;code&gt;wait_until_equal&lt;/code&gt;?&lt;/p&gt;
+&lt;h1&gt;The rules&lt;/h1&gt;
+&lt;p&gt;Without further requirements, the problem is trivial: just have a single lock
+guarding the array, together with a single condition variable that all readers
+wait on. But this severely limits concurrency: calls to &lt;code&gt;modify&lt;/code&gt; that operate on
+different indices block one another. It's also wasteful of the waiter time;
+every waiter must wake up, acquire the lock, and re-check the values of its
+indices on &lt;em&gt;every&lt;/em&gt; modification to the array, even if the indices it's
+interested in weren't modified. This motivates the first rule:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Calls to one of the functions should not block waiting on a call to another
+  one of the functions unless the two calls have one of their index arguments
+  equal.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;We'll relax the problem a little bit, to make it easier, to get a second rule
+that deals with races between &lt;code&gt;modify&lt;/code&gt; calls.&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;If a call to &lt;code&gt;wait_until_equal(index1, index2)&lt;/code&gt; occurs, and the elements at
+  indices &lt;code&gt;index1&lt;/code&gt; and &lt;code&gt;index2&lt;/code&gt; become equal only briefly, it's okay for the
+  &lt;code&gt;wait_until_equal&lt;/code&gt; call not to return; it can "miss" situations that don't
+  exist for long enough.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;We don't want this rule to be abused though (e.g. with a &lt;code&gt;wait_until_equal&lt;/code&gt; call
+that never returns), so we'll add one final rule.&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;If the elements at the indices passed to a &lt;code&gt;wait_until_equal&lt;/code&gt; call become and
+  remain equal, the &lt;code&gt;wait_until_equal&lt;/code&gt; call will eventually return.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Finally, we want to make sure we don't waste too much CPU time; we'll have a
+no-spinning requirement&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;The internals of &lt;code&gt;wait_until_equal&lt;/code&gt; shouldn't busy-wait by spinning until
+  their conditions become true. Similarly, loops like
+  &lt;code&gt;while (!check_condition())
+  { std::this_thread::sleep_for(std::chrono::milliseconds(15)) }&lt;/code&gt; are cheating.
+  The &lt;code&gt;wait_until_equal&lt;/code&gt; function shouldn't use CPU time that's not proportional
+  to the number of &lt;code&gt;modify&lt;/code&gt; operations that are used on its arguments.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;These rules are really just to try to prevent "clever" solutions that dodge the
+real concurrency issues that are present. I promise that there's a reasonable
+solution to this that doesn't involve waiting forever, calling &lt;code&gt;exit(0)&lt;/code&gt;, or
+other trickery. The only concurrency primitives you need are mutexes and
+condition variables, and you don't need an unreasonable number of them (e.g.
+having &lt;code&gt;N**2&lt;/code&gt; variables is unnecessary).&lt;/p&gt;
+&lt;h1&gt;Discussion&lt;/h1&gt;
+&lt;p&gt;This problem is pretty abstracted, and the API presented to users is unrealistic
+in several ways:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;There's no way to &lt;em&gt;read&lt;/em&gt; the values from the array, only to set them and
+    compare them for equality&lt;/li&gt;
+&lt;li&gt;Once you know two values are equal, they won't necessarily remain equal
+    after the call to &lt;code&gt;wait_until_equal&lt;/code&gt; returns, so you can't rely on their
+    equality.&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;But these problems are easy to remedy, once a solution to this simplified
+problem is found, and solving only the simplification gets to the heart of the
+matter. There are real-world problems that require techniques similar to this
+one.&lt;/p&gt;
+&lt;p&gt;I'll post a solution sometime in the next couple of weeks. I'll keep it in a
+separate post to avoid spoiling it for anyone reading this one.&lt;/p&gt;</content><category term="concurrency"></category><category term="multithreading"></category><category term="programming"></category></entry><entry><title>Going from lock-free to wait-free</title><link href="http://dgoldblatt.com/going-from-lock-free-to-wait-free.html" rel="alternate"></link><published>2015-05-05T15:20:00-07:00</published><updated>2015-05-05T15:20:00-07:00</updated><author><name>David Goldblatt</name></author><id>tag:dgoldblatt.com,2015-05-05:/going-from-lock-free-to-wait-free.html</id><summary type="html">&lt;p&gt;Using further data replication tricks, we can go from lock-free reads to wait-free ones.&lt;/p&gt;</summary><content type="html">&lt;h1&gt;Introduction&lt;/h1&gt;
+&lt;p&gt;In &lt;a href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html"&gt;the last post&lt;/a&gt;, we
+looked at ways in which replicating data allowed readers to proceed in a
+lock-free manner. In this post, we'll extend this trick further, and show how to
+make readers wait-free.&lt;/p&gt;
+&lt;p&gt;Like last time, we'll make a number of simplifying assumptions throughout:
+counters never overflow, all variables are 0-initialized (unless otherwise
+specified), readers and writers don't throw exceptions, and writers are
+externally synchronized, so we may assume only one writer at a time. These
+limitations are trivial to eliminate.  We'll also leave all atomic memory
+operations with the default sequentially consistent memory order. This is always
+correct, but can be inefficient. A warning: I've thought hard about but not tested the
+included code. As always, check and test before using.&lt;/p&gt;
+&lt;h1&gt;The goal&lt;/h1&gt;
+&lt;p&gt;To make it clear what we're after, we seek an implementation of the following
+interface:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterData&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="nf"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;In which the &lt;code&gt;read()&lt;/code&gt; method always completes in a finite number of steps,
+regardless of any writer activity. The writer might start modifying the
+protected data, get interrupted by the operating system and never rescheduled,
+and readers should &lt;em&gt;still&lt;/em&gt; be able to complete their reads. This should be
+enough to convince us that maintaining multiple copies of the data structure is
+necessary: otherwise, readers would have no copy to read from while the writer
+is blocked (they can't read from the copy the writer is modifying without seeing
+inconsistent state). The writer will have to have some mechanism of directing
+readers to one copy or another of the protected data.&lt;/p&gt;
+&lt;h1&gt;A solution&lt;/h1&gt;
+&lt;h2&gt;Inspiration&lt;/h2&gt;
+&lt;p&gt;The interface above looks similar to that of data protected by a reader-writer
+lock, so let's start there. Below is a simple, reader-preference, busy-waiting
+reader-writer lock. The low-order bit is used to indicate the presence of a
+writer, and all other bits are a count of the number of readers blocking the
+writer from proceeding.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterLock&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;bool&lt;/span&gt; &lt;span class="n"&gt;swap_succeeded&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;do&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;expected&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="n"&gt;swap_succeeded&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;compare_exchange_weak&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;expected&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;kWriterPresent&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;swap_succeeded&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="nb"&gt;false&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;kWriterPresent&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;lock_shared&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;kReaderIncrement&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;kWriterPresent&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// Busy loop&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;unlock_shared&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;kReaderIncrement&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;kWriterPresent&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&amp;lt;&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="k"&gt;static&lt;/span&gt; &lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;kReaderIncrement&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&amp;lt;&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;lock_word_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;We'll take two ideas from this lock:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;Maintaining a count of active readers, which the writer waits to drop to
+    zero.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;Letting the writer advertise its presence to readers, who then know that
+    reading is unsafe.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;We'll combine them with our realizations from the last section: we need multiple
+copies of the data structure, which the writer will move readers between. Since
+we'll have multiple copies, we'll need to apply the writer's modifications to
+each of the copies.&lt;/p&gt;
+&lt;h2&gt;An incorrect approach&lt;/h2&gt;
+&lt;p&gt;Here is a first pass at a solution using reader counts:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterData&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// Move readers away from version i&lt;/span&gt;
+      &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="c1"&gt;// Wait for them to leave&lt;/span&gt;
+      &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="c1"&gt;// Busy wait&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+      &lt;span class="c1"&gt;// Do the write&lt;/span&gt;
+      &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+  &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;This approach doesn't work, because of a race between the reader and writer. To
+see how this race manifests, suppose there is only 1 reader. It reads
+&lt;code&gt;version_for_readers_&lt;/code&gt; to be 0. Then the writer appears, stores 1 into
+&lt;code&gt;version_for_readers_&lt;/code&gt;, and waits for &lt;code&gt;reader_count_[0]&lt;/code&gt; to become 0. Since
+the reader has not yet incremented &lt;code&gt;reader_count_[0]&lt;/code&gt;, the writer may exit its
+loop and begin its write to &lt;code&gt;data_[0]&lt;/code&gt;. The reader then increments
+&lt;code&gt;reader_count_[0]&lt;/code&gt; and proceeds to read from &lt;code&gt;data_[0]&lt;/code&gt;. We now have a writer
+and a reader concurrently accessing &lt;code&gt;data_[0]&lt;/code&gt;, violating our interface.&lt;/p&gt;
+&lt;h2&gt;Fixing the race&lt;/h2&gt;
+&lt;p&gt;To address the problem from the last section, we need to be more precise about
+the meaning of an increment to &lt;code&gt;reader_count_[i]&lt;/code&gt;. It is a mechanism for a
+reader to prevent the writer from beginning a &lt;em&gt;new&lt;/em&gt; modification to &lt;code&gt;data_[i]&lt;/code&gt;.
+This has two consequences:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;If the reader increments &lt;code&gt;reader_count_[i]&lt;/code&gt; and subsequently observes the
+    writer to be absent from version &lt;code&gt;i&lt;/code&gt;, then no write may proceed on version
+    &lt;code&gt;i&lt;/code&gt; until the reader undoes its increment; reading is safe between these
+    points.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;If the reader has incremented &lt;em&gt;both&lt;/em&gt; counters, a writer is prevented from
+    switching versions.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;This suggests the following strategy for readers: read &lt;code&gt;version_for_readers_&lt;/code&gt;,
+and block writers from beginning a new modification to the indicated version.
+Then, check to see if a writer may already be present in version (i.e. check to
+see if the race from the previous section occurred). If not; great:
+reading is safe on the version until the reader unblocks the writer from
+beginning a modification to it. If the writer may be present, then the reader
+should try reading from the other version; it blocks updates to that one (so at
+this point, the writer is prevented from starting a modification to &lt;em&gt;either&lt;/em&gt;
+version). Then, the reader can recheck for writer presence, safe in the
+knowledge that whichever version is safe to read from will remain safe until it
+unblocks the writer from it. Whichever version the reader is not reading from,
+it can then unblock the writer from.&lt;/p&gt;
+&lt;p&gt;Here's how this looks in code:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterData&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="c1"&gt;// We&amp;#39;ll fill this in later.&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_2&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version_1&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="n"&gt;version_2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// We stopped new modifications to version version_1, and subsequently&lt;/span&gt;
+      &lt;span class="c1"&gt;// observed that the writer wants us to use version version_1,&lt;/span&gt;
+      &lt;span class="c1"&gt;// indicating that no write is happening there. So, no write is&lt;/span&gt;
+      &lt;span class="c1"&gt;// happening to version version_1, and no write will start there until&lt;/span&gt;
+      &lt;span class="c1"&gt;// we decrement reader_count_[version_1].&lt;/span&gt;
+      &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// The version changed out from under us; a writer might have already&lt;/span&gt;
+      &lt;span class="c1"&gt;// begun modifying version version_1 before we blocked modifications&lt;/span&gt;
+      &lt;span class="c1"&gt;// to it. Block modifications to version_2, and check if it&amp;#39;s safe.&lt;/span&gt;
+      &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="c1"&gt;// At this point, no new modifications may begin on either version.&lt;/span&gt;
+      &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_3&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="c1"&gt;// Version version_3 must be safe; the writer told us to use it, so&lt;/span&gt;
+      &lt;span class="c1"&gt;// the wasn&amp;#39;t modifying it at the time of the previous statement.&lt;/span&gt;
+      &lt;span class="c1"&gt;// Moreover, modifications to either version aren&amp;#39;t allowed to be&lt;/span&gt;
+      &lt;span class="c1"&gt;// started. So no modification started on version version_3 between&lt;/span&gt;
+      &lt;span class="c1"&gt;// the previous statement (when reading was safe), and will not start&lt;/span&gt;
+      &lt;span class="c1"&gt;// until we unblock writes to version version_3. We can read it&lt;/span&gt;
+      &lt;span class="c1"&gt;// safely.&lt;/span&gt;
+      &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_3&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="c1"&gt;// Unblock the *other* version&lt;/span&gt;
+      &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="n"&gt;version_3&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// We&amp;#39;ve ensured reading is safe at this point.&lt;/span&gt;
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_read&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// Unblock the writer from the version we read.&lt;/span&gt;
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_read&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="c1"&gt;// Busy wait&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+      &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;version_for_readers_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+  &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;Why shouldn't a reader always block writes to both versions before
+checking &lt;code&gt;version_for_readers_&lt;/code&gt;, and then unblock the one not in use?&lt;/p&gt;
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;Give a similar strategy that detects writer presence by using the
+&lt;code&gt;lock_word_&lt;/code&gt; representation of the reader-writer lock above, and eliminating
+&lt;code&gt;version_for_readers_&lt;/code&gt;.&lt;/p&gt;
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;Give a similar strategy that allows readers to block writers by
+writing to a per-reader data structure, which the writer may observe. Note: as a
+consequence, we can see that no atomic compare-and-swap or fetch-and-add or
+other RMW primitives are necessary to implement the interface and progress
+guarantees we sought. This is a rather interesting fact in and of itself.&lt;/p&gt;
+&lt;h1&gt;Increasing writer-performance&lt;/h1&gt;
+&lt;h2&gt;Lazy updates&lt;/h2&gt;
+&lt;p&gt;The careful reader might have noticed that one round of busy looping in the
+&lt;code&gt;write&lt;/code&gt; method above could have been avoided: since the writer waits for all the
+readers to leave the second instance before modifying it, on the &lt;em&gt;next&lt;/em&gt; call
+to &lt;code&gt;write&lt;/code&gt;, there are no readers reading the second instance. So, if the writer
+changed its iteration order to always start on version
+&lt;code&gt;1 - version_for_readers_.load()&lt;/code&gt;, the busy wait loop will complete on the first
+iteration.&lt;/p&gt;
+&lt;p&gt;We can go a step further, however. Once we've performed the write on one
+instance of the data structure, and indicated to readers that they should begin
+using it, there's no need for the writer to wait for the readers to leave the
+other copy of the data structure, since no new readers are going to use it.
+Instead, we can store the &lt;code&gt;std::function&lt;/code&gt; that perform the modification of the
+data structure, and leave the work of actually performing the modification for
+the next writer (note then that the passed in function can't e.g. hold
+references to data on the writing thread's stack unless it is sure it will
+outlive the &lt;code&gt;ReaderWriterData&lt;/code&gt;). The next time a write occurs, the writer will
+apply &lt;em&gt;both&lt;/em&gt; modifications to the old copy of the data structure, which
+hopefully all the readers will have already left. If the time between &lt;code&gt;write&lt;/code&gt;
+calls is longer than the time it takes to perform a read, then the writer will
+never have to wait for readers to leave a version of the data structure.&lt;/p&gt;
+&lt;h2&gt;Increased data replication&lt;/h2&gt;
+&lt;p&gt;Even using lazy updates, it is still possible for a writer to have to wait for
+readers to leave. This can be particularly problematic if, for instance, the
+number of readers is higher than the number of CPUs allocated to the process. In
+that case, there will always be some reader which is descheduled, probably for a
+time on the order of milliseconds. Since operations on most data structures are
+much faster (on the order of nano- or micro- seconds), this can lead to
+significant writer slowdowns and busy waiting.&lt;/p&gt;
+&lt;p&gt;To avoid this, we can increase the number of copies of the data structure we
+keep. If slow readers are stuck on version 0 of the data structure and version 1
+is the current one, then a writer may proceed on version 2 without interfering
+with readers or writers. This doubles the amount of time we allow for read
+operations to take before they begin to block writers. This parameter is
+tunable; we can decrease the odds of the writer blocking, at the cost of
+increasing storage consumption and the number of total data structure
+modifications per logical write.&lt;/p&gt;
+&lt;h2&gt;An implementation&lt;/h2&gt;
+&lt;p&gt;The combination of the previous two performance improvements causes some amount
+of subtlety; when we have more than two copies of the data structure, which one
+do we update in response to a new write?&lt;/p&gt;
+&lt;p&gt;It's clear that we can't modify the most recently updated version (that's the
+one new readers will read from). We could proceed in a round-robin manner, but
+that means that the writer might busy-loop waiting for readers to leave one
+version, even if other versions are empty of readers. We will adopt a
+middle-ground: picking the oldest version of the data structure that does not
+have any readers reading from it. This will require us to explicitly keep track
+of the number of modifications each version of the data structure has undergone,
+and to store as many of the &lt;code&gt;std::function&lt;/code&gt;s passed in to &lt;code&gt;write&lt;/code&gt; as is necessary
+to bring the oldest version up to date.&lt;/p&gt;
+&lt;p&gt;Similarly, with more than 2 copies of the data structure, we can't infer the
+version being written using only the version readers should read. Put another
+way, &lt;code&gt;version_for_readers_&lt;/code&gt; in the previous section really served two purposes:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;Letting readers know where to read from&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;Warning readers where a write might be happening.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;In the 2-version case, the version being written was trivially determinable from
+the version readers were reading, so we could handle this with only one
+variable. In the multiply-replicated case, we'll have to split this variable in
+two: &lt;code&gt;current_version_&lt;/code&gt; will be the most up-to-date version of the data
+structure, and tells readers where they should read from, while
+&lt;code&gt;version_being_written_&lt;/code&gt; will indicate where a modification might be underway.
+&lt;code&gt;version_being_written_&lt;/code&gt; functions as sort of an inversion of the
+"hazard-pointer" technique, if you're familiar with such strategies; it's a way
+for writers to indicate dangers to readers.&lt;/p&gt;
+&lt;p&gt;Here is a version of &lt;code&gt;ReaderWriterData&lt;/code&gt; with the optimizations described:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterData&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;written_1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_being_written_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version_1&lt;/span&gt; &lt;span class="o"&gt;!=&lt;/span&gt; &lt;span class="n"&gt;written_1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// Great; we blocked new modifications to version version_1, and then&lt;/span&gt;
+      &lt;span class="c1"&gt;// observed that no in-flight modifications were already happening. We&lt;/span&gt;
+      &lt;span class="c1"&gt;// can proceed on it.&lt;/span&gt;
+      &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="c1"&gt;// The writer moved on, and started a modification on version&lt;/span&gt;
+      &lt;span class="c1"&gt;// version_1. That means current_version_ must have changed. Try again&lt;/span&gt;
+      &lt;span class="c1"&gt;// on that.&lt;/span&gt;
+      &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_2&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="c1"&gt;// Now, new modifications are blocked to versions version_1 and&lt;/span&gt;
+      &lt;span class="c1"&gt;// version_2. At least one of them is not being modified, and so is&lt;/span&gt;
+      &lt;span class="c1"&gt;// safe to read from.&lt;/span&gt;
+      &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;written_2&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_being_written_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version_2&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="n"&gt;written_2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="c1"&gt;// Have to use version version_1.&lt;/span&gt;
+        &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+        &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="c1"&gt;// Can use version version_2.&lt;/span&gt;
+        &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_1&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+        &lt;span class="n"&gt;version_to_read&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;version_2&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_read&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+
+    &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_read&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;fetch_sub&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;in_flight_modifications_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;push_back&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_to_write&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;do&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;version_to_write&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;oldest_version_with_no_readers&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;version_being_written_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// When we exit the loop, we&amp;#39;ll have warned any possible future readers&lt;/span&gt;
+    &lt;span class="c1"&gt;// that they should avoid version version_to_write, and then observed&lt;/span&gt;
+    &lt;span class="c1"&gt;// that no readers are present in that version. Therefore, any future&lt;/span&gt;
+    &lt;span class="c1"&gt;// readers who try to enter it will observe our write to&lt;/span&gt;
+    &lt;span class="c1"&gt;// version_being_written_.&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// Now, apply all necessary pending modifications to version&lt;/span&gt;
+    &lt;span class="c1"&gt;// version_to_write.&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;index_of_first_unapplied_modification&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt;
+        &lt;span class="n"&gt;modification_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="n"&gt;modification_num_of_front_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;index_of_first_unapplied_modification&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+         &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;in_flight_modifications_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;size&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+         &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;in_flight_modifications_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;](&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+      &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;modification_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// Update readers to use the new version.&lt;/span&gt;
+    &lt;span class="n"&gt;version_being_written_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version_to_write&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+    &lt;span class="c1"&gt;// Clear out any modifications that have been applied to every version.&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;min_modification_count&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;min_element&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;modification_count_&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+                                                  &lt;span class="n"&gt;modification_count_&lt;/span&gt;
+                                                      &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;modification_num_of_front_&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;min_modification_count&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;in_flight_modifications_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;pop_front&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;modification_num_of_front_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;versions_ordered_by_age&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;result&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;result&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;sort&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;result&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;begin&lt;/span&gt;&lt;span class="p"&gt;(),&lt;/span&gt; &lt;span class="n"&gt;result&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt; &lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;](&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;modification_count&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;modification_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+    &lt;span class="p"&gt;});&lt;/span&gt;
+    &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;result&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;oldest_version_with_no_readers&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;array&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;versions&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;versions_ordered_by_age&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;true&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;versions&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+          &lt;span class="c1"&gt;// Don&amp;#39;t want try to update the current version!&lt;/span&gt;
+          &lt;span class="k"&gt;continue&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+        &lt;span class="p"&gt;}&lt;/span&gt;
+        &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;versions&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+          &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;versions&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+        &lt;span class="p"&gt;}&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The version readers should try to read from&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The version that a writer is currently modifying.&lt;/span&gt;
+  &lt;span class="c1"&gt;// For simplicity, assume this is initially -1.&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;version_being_written_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// All modifications that some version has not yet had applied to it&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;deque&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;in_flight_modifications_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The modification number of the front of in_flight_modifications_&lt;/span&gt;
+  &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;modification_num_of_front_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The modification counts of each version&lt;/span&gt;
+  &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;modification_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The number of readers reading each version&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_count_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+
+  &lt;span class="c1"&gt;// The versions themselves.&lt;/span&gt;
+  &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_versions&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;In the last section, there was an exercise to use a per-reader data
+structure instead of atomic fetch-and-adds. Generalize the solution to use the
+optimizations described, using no more than &lt;code&gt;O(num_readers * num_versions)&lt;/code&gt;
+atomic integer variables in the helper data structures.&lt;/p&gt;
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;Reduce the space usage from the previous exercise to be only
+&lt;code&gt;O(num_readers + num_versions)&lt;/code&gt;.&lt;/p&gt;
+&lt;h2&gt;Going to the limit - getting a wait-free writer&lt;/h2&gt;
+&lt;p&gt;With the optimizations above, we can reduce wait times for writers
+significantly. This leads us to wonder -- can we reduce them all the way to 0,
+and have a writer that can't be blocked by readers? Perhaps surprisingly, the
+answer is yes, so long as we can bound the number of readers.&lt;/p&gt;
+&lt;p&gt;Consider what happens when we set &lt;code&gt;num_versions&lt;/code&gt; to &lt;code&gt;2 * num_readers + 2&lt;/code&gt;.
+The writer is wait free so long as there is some unblocked version other than
+the current version. Each reader blocks at most 2 versions at a time, so there
+are at most &lt;code&gt;2 * num_readers&lt;/code&gt; versions blocked at a time. There are therefore at
+most &lt;code&gt;2 * num_readers + 1&lt;/code&gt; versions the writer cannot proceed on, and so there
+is at least one version that the writer &lt;em&gt;can&lt;/em&gt; proceed on. All loops in the
+writer will therefore terminate in at most 1 iteration, and the writer is wait
+free.&lt;/p&gt;
+&lt;h3&gt;Exercise&lt;/h3&gt;
+&lt;p&gt;Come up with a scheme that requires only &lt;code&gt;num_readers + 2&lt;/code&gt; copies of a
+data structure to provide wait-freedom.&lt;/p&gt;
+&lt;p&gt;Hint: extend the strategy, developed in the previous exercises, of per-reader
+state. Introduce a reader state corresponding to "about to perform a read".
+Readers set their state to "about to perform a read", and then compare and swap
+their state to "reading on version &lt;code&gt;X&lt;/code&gt;". Writers try to compare and swap all
+reader states from "about to perform a read" to "reading on version &lt;code&gt;Y&lt;/code&gt;" before
+writing to a version other than &lt;code&gt;Y&lt;/code&gt;.&lt;/p&gt;
+&lt;h1&gt;Possible extensions&lt;/h1&gt;
+&lt;p&gt;There are a number of extensions that could be applied to the strategies
+discussed in this post. Two that stand out as being of particular practical
+performance are adding a try-write method, and adopting these techniques to use
+futexes or a similar technique.&lt;/p&gt;
+&lt;p&gt;Try-write is straightforward: an attempt to write is made, but the writer does
+not proceed if it might block. This is a straightforward: instead of looping in
+the &lt;code&gt;write&lt;/code&gt; method, the writer only tries to write once. If it fails, it returns
+a status indicating that the write did not occur.&lt;/p&gt;
+&lt;p&gt;A futex is a scheduling primitive used to efficiently implement mixed
+user-level/kernel-level locking on Linux. Fast-path, contention-free lock
+acquisitions happen entirely in user-space, only entering the kernel in the case
+where a lock is contended, and then blocking, allowing other threads to use the
+CPU time that would otherwise be spent spinning. This mechanism could be used to
+avoid the spinning required by &lt;code&gt;write&lt;/code&gt;. The readers would keep a count of the
+number of blocked versions of the data structure, waking up the writer when the
+count becomes nonzero.&lt;/p&gt;
+&lt;h1&gt;Notes&lt;/h1&gt;
+&lt;p&gt;The reader-preference reader-writer lock is a well-known algorithm due to
+&lt;a href="http://dl.acm.org/citation.cfm?id=109637"&gt;Mellor-Crummey and Scott&lt;/a&gt;.&lt;/p&gt;
+&lt;p&gt;Many of the ideas here a well-known in the garbage collection and database
+literature; in particular:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;Maintaining multiple copies of a data structure to allow readers to avoid
+    waiting for writers&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;Maintaining versions with those copies so that writers can proceed while
+    readers are reading from an old version&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;Keeping a log of modifications to the data, which gets applied in batch.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Instead of detailing all of these, I'll note only some of the literature that
+focuses on strategies for in-memory data structures on shared-memory
+multiprocessors with simple version reclamation semantics (i.e. which do not
+require the use of garbage collection).&lt;/p&gt;
+&lt;p&gt;The first algorithm that allows for wait-free readers in the presence of a
+writer goes back to &lt;a href="http://dl.acm.org/citation.cfm?id=357198"&gt;Peterson&lt;/a&gt;, whose
+scheme is also wait-free for the writer. It comes at the cost of maintaining
+&lt;code&gt;num_readers + 2&lt;/code&gt; copies of the protected data, which he shows to be both
+necessary and sufficient. His scheme is only applicable to arrays of data which
+allow concurrent reads and writes (a la &lt;code&gt;std::atomic&amp;lt;char&amp;gt;[N]&lt;/code&gt;), and requires
+the reader to execute up to 3 physical reads per logical read.&lt;/p&gt;
+&lt;p&gt;&lt;a href="http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.50.5034"&gt;Chen and
+Burns&lt;/a&gt; show how
+to use a compare-and-swap primitive to implement a scheme that requires only 1
+read of the data structure per logical read operation, and does not require
+concurrent access to a data structure by both a reader and a writer.
+writer to write to a copy of the data structure concurrently with a reader
+reading from it.  It also uses the theoretical minimum of &lt;code&gt;num_readers + 2&lt;/code&gt;
+copies of the data.&lt;/p&gt;
+&lt;p&gt;&lt;a href="http://concurrencyfreaks.blogspot.com/2013/12/left-right-classical-algorithm.html"&gt;Ramalhete and
+Correia&lt;/a&gt;
+show how to reduce the number of copies of the data to only 2, at the cost of no
+longer being wait-free for the writer. They provide several variants of their
+technique, which they call the "left-right" algorithm. The two-copy strategy
+presented here is a variant of this algorithm.&lt;/p&gt;
+&lt;p&gt;The fetch-and-add based concurrency-control strategy used here is, as far as I
+know, novel, but it is reminiscent of the "Epoch-based reclamation" strategy
+used by &lt;a href="http://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf"&gt;Fraser&lt;/a&gt; to
+provide exclusion between readers and deleters of nodes in lock-free data
+structures. Similarly, I believe the lazy-update scheme and the generalization
+to multiply-replicated data are new, though lazy-updates bears similarity
+to &lt;a href="http://dl.acm.org/citation.cfm?id=1217965"&gt;Shalev and Shavit&lt;/a&gt;'s Predictive
+Log-Synchronization technique. In the same paper, they present a strategy that
+allows concurrent reads by switching writers between two copies of a data
+structure. Their solution, however, is not wait-free for readers.&lt;/p&gt;
+&lt;p&gt;Futexes were introduced to the linux kernel by
+&lt;a href="https://www.kernel.org/doc/ols/2002/ols2002-pages-479-495.pdf"&gt;Franke, Russell, and Kirkwood&lt;/a&gt;,
+though they bear similarities to BeOS "benaphores".&lt;/p&gt;</content><category term="concurrency"></category><category term="multithreading"></category><category term="lockfree"></category><category term="programming"></category></entry><entry><title>Lock-free reads through data replication</title><link href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html" rel="alternate"></link><published>2015-04-29T20:30:00-07:00</published><updated>2015-04-29T20:30:00-07:00</updated><author><name>David Goldblatt</name></author><id>tag:dgoldblatt.com,2015-04-29:/lock-free-reads-through-data-replication.html</id><summary type="html">&lt;p&gt;By keeping multiple copies of a data object around, we can allow readers to proceed even while a writer might be blocked mid-write.&lt;/p&gt;</summary><content type="html">&lt;h1&gt;Introduction&lt;/h1&gt;
+&lt;p&gt;Seqlocks and reader-writer locks are two techniques used to control access to
+shared, read-mostly data in multithreaded programs. Briefly, seqlocks work by
+counting modifications to a data structure so that readers can see if a
+modification occurred during their read (so that they know their read was
+hazardous, and they should retry). Reader-writer locks work by allowing
+exclusive access to a data structure to either a single writer, or many readers.&lt;/p&gt;
+&lt;p&gt;These approaches share a common problem: a writer that stalls (due to a page fault,
+descheduling, or a long-running computation, for instance) inside a critical
+section can block the readers indefinitely. We'd like to eliminate this
+restriction; to allow readers to continue even while a writer is blocked, even
+if that writer is blocked inside a critical section. That is to say, readers
+should be lock-free with respect to writers. We seek a solution that allows
+readers to continue even if a writer is blocked inside a critical section.&lt;/p&gt;
+&lt;p&gt;To accomplish this, we'll keep two copies of our data structure. The writer
+needs to update both copies of the data, one after the other, in order to
+logically complete a write. If the writer blocks, it will be blocked inside an
+update to only one of the copies. The readers can then proceed by reading from
+the other copy, giving us the lock-freedom property we sought.&lt;/p&gt;
+&lt;p&gt;For simplicity, we'll consider only the case of a single writer thread (there
+can be  many reader threads). This limitation can be easily removed by adding an
+additional mutex to any data structures we consider, which a writer thread must
+acquire before and release after invoking the functions we describe. I've
+thought hard about the code here but haven't tested it, so be cautious before
+using it.&lt;/p&gt;
+&lt;h1&gt;Background&lt;/h1&gt;
+&lt;h2&gt;Reader-writer locks&lt;/h2&gt;
+&lt;p&gt;Reader-writer locks provide safe access to shared data by changing the control
+flow of threads attempting to access the data. When a writer owns the lock, it
+owns it uniquely, and readers block if they attempt to access it. Alternatively,
+some number of readers may share ownership of the lock; they are then allowed to
+read but not modify the data structure, and any writers block while readers are
+present.&lt;/p&gt;
+&lt;p&gt;Reader-writer locks are standardized in C++14 via the &lt;code&gt;std::shared_timed_mutex&lt;/code&gt;
+class. Below is a class that encapsulates the protected data and the protection
+mechanism. Readers and the writer pass in a callback function that performs the
+desired operations. For simplicity, we'll ignore things like exception safety.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReaderWriterLock&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;lock_shared&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;unlock_shared&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;shared_timed_mutex&lt;/span&gt; &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h2&gt;Seqlocks&lt;/h2&gt;
+&lt;p&gt;RW locks often perform poorly in practice. Readers must update lock metadata in
+order to indicate their presence to a potential future writer. In typical
+implementations, this involves obtaining exclusive write access to the cacheline
+containing the lock, which leads to a cache miss for subsequent readers. Even
+with fast modern memory systems, cache misses can take longer than a short
+critical section, and, what's worse, can be sequentialized in the memory system.
+Updates to the lock itself then become a bottleneck. To avoid this, we'd like a
+concurrency primitive in which readers can be truly read-only. The seqlock is
+one such primitive.&lt;/p&gt;
+&lt;p&gt;Seqlocks (short for sequence locks, for reasons which will soon become clear)
+allow readers to access data concurrently with writers. Since readers proceed
+without blocking writers, the readers might see an inconsistent state for the
+protected data (imagine a reader that reads half the protected data before the
+writer modifies it, then half after). The seqlock provides a mechanism to detect
+such a conflict, indicating that the reader should retry.&lt;/p&gt;
+&lt;p&gt;Associated with a seqlock is a sequence number. The sequence number starts at 0,
+and is incremented before and after each write. This implies that at any time
+between writes (and therefore, when the data is in a consistent state), the
+sequence number is even, since the number of iniitial increments will equal the
+number of concluding ones. Readers repeatedly read the sequence number, then the
+data structure, then the sequence number again.  If the sequence numbers are
+even (indicating that they weren't read during a writer critical section) and
+equal (indicating that no writer critical section started and finished in
+between the two reads), then the reader can infer that the writer did not
+interfere with its read. Otherwise, the reader should retry.&lt;/p&gt;
+&lt;p&gt;The code below encapsulates some seqlock-protected data. Because reads
+and writes may occur on the object simultaneously, we have to represent the
+stored data using &lt;code&gt;std::atomic&lt;/code&gt; variables; in turn, this requires that we can
+treat the protected data as trivially copyable. For simplicity, we won't enforce
+this. Similarly, we'll ignore overflow of &lt;code&gt;sequence_number_&lt;/code&gt;, use the
+default memory order for all operations (giving sequential consistency), and
+ignore the inevitable reads from an uninitialized &lt;code&gt;data_&lt;/code&gt; array.&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;SeqLocked&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;seq0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;seq1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;do&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;seq1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;!=&lt;/span&gt; &lt;span class="n"&gt;seq1&lt;/span&gt; &lt;span class="o"&gt;||&lt;/span&gt; &lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="c1"&gt;// Remember: we are assuming there is only one writer;&lt;/span&gt;
+    &lt;span class="c1"&gt;// this read is safe no matter what.&lt;/span&gt;
+    &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;raw_write_from&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;output&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;output&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;raw_write_from&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;input&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;input&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;)];&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h1&gt;The problem: blocked writers&lt;/h1&gt;
+&lt;p&gt;Suppose the writer is modifying some of the data protected by a seqlock. It
+increments the sequence number, begins writing to the data, but is preempted by
+the operating system before it completes. Then, all readers are blocked until
+the writer is rescheduled and completes the write. The readers, therefore, are
+not lock-free with respect to the writer. An analogous situation can occur using
+a reader-writer lock.&lt;/p&gt;
+&lt;h1&gt;A solution: replicate the data&lt;/h1&gt;
+&lt;p&gt;The trick we'll use to solve this problem is old, but not widely known. We'll
+keep two copies of the data being protected. If a writer is blocked midway
+through a write to one copy of the data, the reader can still continue its read
+through the other copy.&lt;/p&gt;
+&lt;p&gt;More specifically, a reader will attempt to complete its read on one copy of the
+data. If it succeeds, great; the reader is done. If it fails, it will try to
+read from the other copy of the data. This process repeats until a read attempt
+succeeds. The writer updates one copy of the data structure, and then the other.&lt;/p&gt;
+&lt;p&gt;Here is how this technique looks for the reader-writer lock (again, we'll ignore
+trivialities like counter overflow and exceptions):&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;class&lt;/span&gt; &lt;span class="nc"&gt;ReplicatedReaderWriterLock&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version_to_use&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(;;&lt;/span&gt; &lt;span class="n"&gt;version_to_use&lt;/span&gt;&lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_use&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;try_lock_shared&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="k"&gt;break&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_use&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+    &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version_to_use&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;unlock_shared&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;lock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;]);&lt;/span&gt;
+      &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;unlock&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;shared_timed_mutex&lt;/span&gt; &lt;span class="n"&gt;mu_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+  &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;p&gt;Note: the reader-writer variant we present is not technically lock-free in our
+setting; a try_lock_shared call may fail spuriously and return false even if the
+lock is available in C++14. This is a technical detail and can be remedied, but
+we won't do so here; such a problem showing up in practice is vanishingly
+unlikely.&lt;/p&gt;
+&lt;h1&gt;Decreasing reader failure rates through further replication&lt;/h1&gt;
+&lt;p&gt;The technique in the previous section is enough to provide a form of
+lock-freedom, but readers may still be starved for access if writers continue
+much more quickly than them (a writer modifies both copies of a seqlock'd data
+instance before a reader is able to read one, for instance). Here, we'll
+consider an extension that gives us reduced chances of writer interference, at
+the cost of additional copies of a data structure.&lt;/p&gt;
+&lt;p&gt;The key idea is to increase the amount of replication beyond two copies of a
+data object. In order for the writer to block readers, it must update all the
+objects before the reader reads any of them. Increasing the amount of
+replication increases the likelihood of readers succeeding.&lt;/p&gt;
+&lt;p&gt;Here's how this looks for the seqlock:&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;span class="k"&gt;template&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="k"&gt;typename&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;num_replicas&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
+&lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;ReplicatedSeqLocked&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+ &lt;span class="k"&gt;public&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;seq0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;seq1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="k"&gt;do&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+      &lt;span class="n"&gt;seq1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt; &lt;span class="k"&gt;while&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;!=&lt;/span&gt; &lt;span class="n"&gt;seq1&lt;/span&gt; &lt;span class="o"&gt;||&lt;/span&gt; &lt;span class="n"&gt;seq0&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="mi"&gt;2&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+
+    &lt;span class="n"&gt;reader_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+  &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;function&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;version&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+    &lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;new_version&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;%&lt;/span&gt; &lt;span class="n"&gt;num_replicas&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="n"&gt;T&lt;/span&gt; &lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;writer_fn&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;new_version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;new_version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;raw_write_from&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;value&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;new_version&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;fetch_add&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+    &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;new_version&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+  &lt;span class="p"&gt;}&lt;/span&gt;
+
+ &lt;span class="k"&gt;private&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;
+  &lt;span class="k"&gt;struct&lt;/span&gt; &lt;span class="n"&gt;SeqLockData&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+    &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;raw_read_into&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;output&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;output&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;load&lt;/span&gt;&lt;span class="p"&gt;();&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="kt"&gt;void&lt;/span&gt; &lt;span class="n"&gt;raw_write_from&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="k"&gt;const&lt;/span&gt; &lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt; &lt;span class="n"&gt;input&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+      &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt; &lt;span class="o"&gt;++&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;
+        &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;].&lt;/span&gt;&lt;span class="n"&gt;store&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="n"&gt;input&lt;/span&gt; &lt;span class="o"&gt;+&lt;/span&gt; &lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+      &lt;span class="p"&gt;}&lt;/span&gt;
+    &lt;span class="p"&gt;}&lt;/span&gt;
+
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;sequence_number_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+    &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;char&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="k"&gt;sizeof&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;T&lt;/span&gt;&lt;span class="p"&gt;)];&lt;/span&gt;
+  &lt;span class="p"&gt;};&lt;/span&gt;
+
+  &lt;span class="n"&gt;SeqLockData&lt;/span&gt; &lt;span class="n"&gt;data_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;num_replicas&lt;/span&gt;&lt;span class="p"&gt;];&lt;/span&gt;
+  &lt;span class="n"&gt;std&lt;/span&gt;&lt;span class="o"&gt;::&lt;/span&gt;&lt;span class="n"&gt;atomic&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="kt"&gt;int&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt; &lt;span class="n"&gt;current_version_&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;};&lt;/span&gt;
+&lt;/pre&gt;&lt;/div&gt;
+
+
+&lt;h1&gt;Some concluding notes on our implementation&lt;/h1&gt;
+&lt;p&gt;There are a few differences between the replicated seqlock and replicated
+reader-writer lock.&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;The seqlock version updates the entire data structure on every modification.
+  The reader-writer one can make small in-place updates. This is a consequence
+  of the API we chose for our implementations, so it could potentially be
+  eliminated, but this would complicate the writer interface (the readers and
+  writers would have to deal with atomic-wrapped data directly, and ask the
+  protecting data structure whether its reads were safe).&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;The converse to this is that the replicated seqlock need only modify one
+  version of the data, whereas a replicated reader-writer lock must modify all
+  copies of the data.&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;An &lt;code&gt;N&lt;/code&gt;-replicated reader-writer lock enables another optimization: a thread
+  can hash its thread-id or CPU number to get an index to read from:
+  &lt;code&gt;thread_id % N&lt;/code&gt;. This spreads around the contention on lock-metadata,
+  reducing the performance overhead of the lock. In the limit, we have a data
+  instance per CPU, and can avoid all non-local writes in the reader path.&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Additionally, note that we could have used a single sequence counter in the
+ReplicatedSeqLock, shared between all data instances. Readers would check it to
+see that the range of modified instances does not include the version that it
+read from. This results in a modest space savings, at the cost of losing some
+simplicity of implementation.&lt;/p&gt;
+&lt;h1&gt;Notes&lt;/h1&gt;
+&lt;p&gt;Reader-writer locks were introduced by &lt;a href="http://dl.acm.org/citation.cfm?id=362813"&gt;Courtois et
+al.&lt;/a&gt;,
+and are a well-known synchronization tool.&lt;/p&gt;
+&lt;p&gt;Seqlocks were popularized by their introduction into the Linux kernel by &lt;a href="https://lwn.net/Articles/21379/"&gt;Stephen
+Hemminger (building on the work of Andrea
+Arcangeli)&lt;/a&gt;, but were introduced by
+&lt;a href="http://dl.acm.org/citation.cfm?id=359878"&gt;Leslie Lamport&lt;/a&gt;, or arguably even earlier, in the
+work of &lt;a href="http://dl.acm.org/citation.cfm?id=806505"&gt;William B. Easton&lt;/a&gt;. This fact
+is not widely known.&lt;/p&gt;
+&lt;p&gt;The idea of using multiple copies of a data structure to improve the blocking 
+properties of readers goes back to
+&lt;a href="http://dl.acm.org/citation.cfm?id=357198"&gt;Peterson&lt;/a&gt;,
+who introduced a mechanism which is wait-free for the writer as well as readers.
+These ideas were explored most fully by &lt;a href="http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.50.5034"&gt;Chen and
+Burns&lt;/a&gt;.
+&lt;a href="http://dl.acm.org/citation.cfm?id=1455262"&gt;Larsson et al.&lt;/a&gt; provide a
+comprehensive survey.
+&lt;a href="http://dl.acm.org/citation.cfm?id=128736"&gt;Lamport&lt;/a&gt; uses a clever variant of
+a similar idea as well.&lt;/p&gt;
+&lt;p&gt;The specific cases of replicating
+data for reader-writer locks and seqlocks is a well-known trick, but I can't
+find a cite for the first use. It is used, for instance, in &lt;a href="http://lxr.free-electrons.com/source/kernel/time/timekeeping.c?v=3.17#L231"&gt;the Linux
+kernel&lt;/a&gt;,
+and explored by &lt;a href="http://concurrencyfreaks.blogspot.com/2013/11/double-instance-locking.html"&gt;Ramalhete and
+Correia&lt;/a&gt;
+in what they call "double-instance locking".&lt;/p&gt;
+&lt;p&gt;Using &lt;em&gt;more&lt;/em&gt; than two copies of a data structure to improve reader seqlock throughput when
+writers are common is a trick from &lt;a href="http://www.1024cores.net/home/lock-free-algorithms/reader-writer-problem/improved-lock-free-seqlock"&gt;Dmitry Vyukov&lt;/a&gt;.&lt;/p&gt;</content><category term="concurrency"></category><category term="multithreading"></category><category term="lockfree"></category><category term="programming"></category></entry></feed>

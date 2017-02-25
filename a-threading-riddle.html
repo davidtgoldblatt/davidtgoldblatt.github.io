@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <title>A threading riddle</title>
+        <link rel="stylesheet" href="http://dgoldblatt.com/theme/css/main.css" />
+        <link href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="David Goldblatt's website Atom Feed" />
+
+        <!--[if IE]>
+            <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+        <![endif]-->
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="http://dgoldblatt.com/">David Goldblatt's website </a></h1>
+                <nav><ul>
+                    <li><a href="http://dgoldblatt.com/pages/about.html">About</a></li>
+                    <li class="active"><a href="http://dgoldblatt.com/category/blog.html">Blog</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="http://dgoldblatt.com/a-threading-riddle.html" rel="bookmark"
+           title="Permalink to A threading riddle">A threading riddle</a></h1>
+    </header>
+
+    <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-06-24T15:20:00-07:00">
+                Published: Wed 24 June 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-06-24T15:20:00-07:00">
+                Updated: Wed 24 June 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->      <h1>Introduction</h1>
+<p>The two key primitives used as building blocks for (blocking) concurrent
+algorithms are mutexes and condition variables, showing up in C++ as
+<code>std::mutex</code> and <code>std::condition_variable</code>.</p>
+<p>In this post, I'll describe a pair of functions that can be simply described,
+but whose implementation requires a tricky use of these primitives.</p>
+<h1>The problem</h1>
+<p>Suppose we have an array of <code>N</code> <code>int</code>s. There are two functions we want to
+implement:</p>
+<ul>
+<li>
+<p><code>void modify(size_t index, int value);</code> This changes the element at position
+  <code>index</code> to equal <code>value</code>.</p>
+</li>
+<li>
+<p><code>void wait_until_equal(size_t index1, size_t index2);</code> This blocks until the
+  elements at positions <code>index1</code> and <code>index2</code> of the array are equal.</p>
+</li>
+</ul>
+<p>The question is: how do we implement <code>modify</code> and <code>wait_until_equal</code>?</p>
+<h1>The rules</h1>
+<p>Without further requirements, the problem is trivial: just have a single lock
+guarding the array, together with a single condition variable that all readers
+wait on. But this severely limits concurrency: calls to <code>modify</code> that operate on
+different indices block one another. It's also wasteful of the waiter time;
+every waiter must wake up, acquire the lock, and re-check the values of its
+indices on <em>every</em> modification to the array, even if the indices it's
+interested in weren't modified. This motivates the first rule:</p>
+<ul>
+<li>Calls to one of the functions should not block waiting on a call to another
+  one of the functions unless the two calls have one of their index arguments
+  equal.</li>
+</ul>
+<p>We'll relax the problem a little bit, to make it easier, to get a second rule
+that deals with races between <code>modify</code> calls.</p>
+<ul>
+<li>If a call to <code>wait_until_equal(index1, index2)</code> occurs, and the elements at
+  indices <code>index1</code> and <code>index2</code> become equal only briefly, it's okay for the
+  <code>wait_until_equal</code> call not to return; it can "miss" situations that don't
+  exist for long enough.</li>
+</ul>
+<p>We don't want this rule to be abused though (e.g. with a <code>wait_until_equal</code> call
+that never returns), so we'll add one final rule.</p>
+<ul>
+<li>If the elements at the indices passed to a <code>wait_until_equal</code> call become and
+  remain equal, the <code>wait_until_equal</code> call will eventually return.</li>
+</ul>
+<p>Finally, we want to make sure we don't waste too much CPU time; we'll have a
+no-spinning requirement</p>
+<ul>
+<li>The internals of <code>wait_until_equal</code> shouldn't busy-wait by spinning until
+  their conditions become true. Similarly, loops like
+  <code>while (!check_condition())
+  { std::this_thread::sleep_for(std::chrono::milliseconds(15)) }</code> are cheating.
+  The <code>wait_until_equal</code> function shouldn't use CPU time that's not proportional
+  to the number of <code>modify</code> operations that are used on its arguments.</li>
+</ul>
+<p>These rules are really just to try to prevent "clever" solutions that dodge the
+real concurrency issues that are present. I promise that there's a reasonable
+solution to this that doesn't involve waiting forever, calling <code>exit(0)</code>, or
+other trickery. The only concurrency primitives you need are mutexes and
+condition variables, and you don't need an unreasonable number of them (e.g.
+having <code>N**2</code> variables is unnecessary).</p>
+<h1>Discussion</h1>
+<p>This problem is pretty abstracted, and the API presented to users is unrealistic
+in several ways:</p>
+<ul>
+<li>There's no way to <em>read</em> the values from the array, only to set them and
+    compare them for equality</li>
+<li>Once you know two values are equal, they won't necessarily remain equal
+    after the call to <code>wait_until_equal</code> returns, so you can't rely on their
+    equality.</li>
+</ul>
+<p>But these problems are easy to remedy, once a solution to this simplified
+problem is found, and solving only the simplification gets to the heart of the
+matter. There are real-world problems that require techniques similar to this
+one.</p>
+<p>I'll post a solution sometime in the next couple of weeks. I'll keep it in a
+separate post to avoid spoiling it for anyone reading this one.</p>
+    </div><!-- /.entry-content -->
+
+  </article>
+</section>
+        <section id="extras" class="body">
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+                            <li><a href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">atom feed</a></li>
+
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="http://getpelican.com/">Pelican</a>, which takes great advantage of <a href="http://python.org">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="http://coding.smashingmagazine.com/2009/08/04/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+    <script type="text/javascript">
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-64146308-1', 'auto');
+    ga('send', 'pageview');
+    </script>
+</body>
+</html>

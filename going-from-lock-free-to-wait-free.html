@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <title>Going from lock-free to wait-free</title>
+        <link rel="stylesheet" href="http://dgoldblatt.com/theme/css/main.css" />
+        <link href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="David Goldblatt's website Atom Feed" />
+
+        <!--[if IE]>
+            <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+        <![endif]-->
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="http://dgoldblatt.com/">David Goldblatt's website </a></h1>
+                <nav><ul>
+                    <li><a href="http://dgoldblatt.com/pages/about.html">About</a></li>
+                    <li class="active"><a href="http://dgoldblatt.com/category/blog.html">Blog</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="http://dgoldblatt.com/going-from-lock-free-to-wait-free.html" rel="bookmark"
+           title="Permalink to Going from lock-free to wait-free">Going from lock-free to wait-free</a></h1>
+    </header>
+
+    <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-05-05T15:20:00-07:00">
+                Published: Tue 05 May 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-05-05T15:20:00-07:00">
+                Updated: Tue 05 May 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/lockfree.html">lockfree</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->      <h1>Introduction</h1>
+<p>In <a href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html">the last post</a>, we
+looked at ways in which replicating data allowed readers to proceed in a
+lock-free manner. In this post, we'll extend this trick further, and show how to
+make readers wait-free.</p>
+<p>Like last time, we'll make a number of simplifying assumptions throughout:
+counters never overflow, all variables are 0-initialized (unless otherwise
+specified), readers and writers don't throw exceptions, and writers are
+externally synchronized, so we may assume only one writer at a time. These
+limitations are trivial to eliminate.  We'll also leave all atomic memory
+operations with the default sequentially consistent memory order. This is always
+correct, but can be inefficient. A warning: I've thought hard about but not tested the
+included code. As always, check and test before using.</p>
+<h1>The goal</h1>
+<p>To make it clear what we're after, we seek an implementation of the following
+interface:</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReaderWriterData</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">);</span>
+  <span class="kt">void</span> <span class="nf">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">);</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>In which the <code>read()</code> method always completes in a finite number of steps,
+regardless of any writer activity. The writer might start modifying the
+protected data, get interrupted by the operating system and never rescheduled,
+and readers should <em>still</em> be able to complete their reads. This should be
+enough to convince us that maintaining multiple copies of the data structure is
+necessary: otherwise, readers would have no copy to read from while the writer
+is blocked (they can't read from the copy the writer is modifying without seeing
+inconsistent state). The writer will have to have some mechanism of directing
+readers to one copy or another of the protected data.</p>
+<h1>A solution</h1>
+<h2>Inspiration</h2>
+<p>The interface above looks similar to that of data protected by a reader-writer
+lock, so let's start there. Below is a simple, reader-preference, busy-waiting
+reader-writer lock. The low-order bit is used to indicate the presence of a
+writer, and all other bits are a count of the number of readers blocking the
+writer from proceeding.</p>
+<div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">ReaderWriterLock</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">lock</span><span class="p">()</span> <span class="p">{</span>
+    <span class="kt">bool</span> <span class="n">swap_succeeded</span><span class="p">;</span>
+    <span class="k">do</span> <span class="p">{</span>
+      <span class="kt">int</span> <span class="n">expected</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+      <span class="n">swap_succeeded</span> <span class="o">=</span> <span class="n">lock_word_</span><span class="p">.</span><span class="n">compare_exchange_weak</span><span class="p">(</span><span class="n">expected</span><span class="p">,</span> <span class="n">kWriterPresent</span><span class="p">);</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">swap_succeeded</span> <span class="o">==</span> <span class="nb">false</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">unlock</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">lock_word_</span><span class="p">.</span><span class="n">fetch_sub</span><span class="p">(</span><span class="n">kWriterPresent</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">lock_shared</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">lock_word_</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="n">kReaderIncrement</span><span class="p">);</span>
+    <span class="k">while</span> <span class="p">(</span><span class="n">lock_word_</span><span class="p">.</span><span class="n">load</span><span class="p">()</span> <span class="o">&amp;</span> <span class="n">kWriterPresent</span><span class="p">)</span> <span class="p">{</span>
+      <span class="c1">// Busy loop</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">unlock_shared</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">lock_word_</span><span class="p">.</span><span class="n">fetch_sub</span><span class="p">(</span><span class="n">kReaderIncrement</span><span class="p">);</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="k">static</span> <span class="k">const</span> <span class="kt">int</span> <span class="n">kWriterPresent</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">0</span><span class="p">;</span>
+  <span class="k">static</span> <span class="k">const</span> <span class="kt">int</span> <span class="n">kReaderIncrement</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="mi">1</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">lock_word_</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>We'll take two ideas from this lock:</p>
+<ul>
+<li>
+<p>Maintaining a count of active readers, which the writer waits to drop to
+    zero.</p>
+</li>
+<li>
+<p>Letting the writer advertise its presence to readers, who then know that
+    reading is unsafe.</p>
+</li>
+</ul>
+<p>We'll combine them with our realizations from the last section: we need multiple
+copies of the data structure, which the writer will move readers between. Since
+we'll have multiple copies, we'll need to apply the writer's modifications to
+each of the copies.</p>
+<h2>An incorrect approach</h2>
+<p>Here is a first pass at a solution using reader counts:</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReaderWriterData</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kt">int</span> <span class="n">version</span> <span class="o">=</span> <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">version</span><span class="p">]);</span>
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="c1">// Move readers away from version i</span>
+      <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+      <span class="c1">// Wait for them to leave</span>
+      <span class="k">while</span> <span class="p">(</span><span class="n">reader_count_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">load</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+        <span class="c1">// Busy wait</span>
+      <span class="p">}</span>
+      <span class="c1">// Do the write</span>
+      <span class="n">writer_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">version_for_readers_</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">reader_count_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+  <span class="n">T</span> <span class="n">data_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>This approach doesn't work, because of a race between the reader and writer. To
+see how this race manifests, suppose there is only 1 reader. It reads
+<code>version_for_readers_</code> to be 0. Then the writer appears, stores 1 into
+<code>version_for_readers_</code>, and waits for <code>reader_count_[0]</code> to become 0. Since
+the reader has not yet incremented <code>reader_count_[0]</code>, the writer may exit its
+loop and begin its write to <code>data_[0]</code>. The reader then increments
+<code>reader_count_[0]</code> and proceeds to read from <code>data_[0]</code>. We now have a writer
+and a reader concurrently accessing <code>data_[0]</code>, violating our interface.</p>
+<h2>Fixing the race</h2>
+<p>To address the problem from the last section, we need to be more precise about
+the meaning of an increment to <code>reader_count_[i]</code>. It is a mechanism for a
+reader to prevent the writer from beginning a <em>new</em> modification to <code>data_[i]</code>.
+This has two consequences:</p>
+<ul>
+<li>
+<p>If the reader increments <code>reader_count_[i]</code> and subsequently observes the
+    writer to be absent from version <code>i</code>, then no write may proceed on version
+    <code>i</code> until the reader undoes its increment; reading is safe between these
+    points.</p>
+</li>
+<li>
+<p>If the reader has incremented <em>both</em> counters, a writer is prevented from
+    switching versions.</p>
+</li>
+</ul>
+<p>This suggests the following strategy for readers: read <code>version_for_readers_</code>,
+and block writers from beginning a new modification to the indicated version.
+Then, check to see if a writer may already be present in version (i.e. check to
+see if the race from the previous section occurred). If not; great:
+reading is safe on the version until the reader unblocks the writer from
+beginning a modification to it. If the writer may be present, then the reader
+should try reading from the other version; it blocks updates to that one (so at
+this point, the writer is prevented from starting a modification to <em>either</em>
+version). Then, the reader can recheck for writer presence, safe in the
+knowledge that whichever version is safe to read from will remain safe until it
+unblocks the writer from it. Whichever version the reader is not reading from,
+it can then unblock the writer from.</p>
+<p>Here's how this looks in code:</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReaderWriterData</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="c1">// We&#39;ll fill this in later.</span>
+    <span class="kt">int</span> <span class="n">version_to_read</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+    <span class="kt">int</span> <span class="n">version_1</span> <span class="o">=</span> <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_1</span><span class="p">].</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="kt">int</span> <span class="n">version_2</span> <span class="o">=</span> <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">version_1</span> <span class="o">==</span> <span class="n">version_2</span><span class="p">)</span> <span class="p">{</span>
+      <span class="c1">// We stopped new modifications to version version_1, and subsequently</span>
+      <span class="c1">// observed that the writer wants us to use version version_1,</span>
+      <span class="c1">// indicating that no write is happening there. So, no write is</span>
+      <span class="c1">// happening to version version_1, and no write will start there until</span>
+      <span class="c1">// we decrement reader_count_[version_1].</span>
+      <span class="n">version_to_read</span> <span class="o">=</span> <span class="n">version_1</span><span class="p">;</span>
+    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+      <span class="c1">// The version changed out from under us; a writer might have already</span>
+      <span class="c1">// begun modifying version version_1 before we blocked modifications</span>
+      <span class="c1">// to it. Block modifications to version_2, and check if it&#39;s safe.</span>
+      <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_2</span><span class="p">].</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+      <span class="c1">// At this point, no new modifications may begin on either version.</span>
+      <span class="kt">int</span> <span class="n">version_3</span> <span class="o">=</span> <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="c1">// Version version_3 must be safe; the writer told us to use it, so</span>
+      <span class="c1">// the wasn&#39;t modifying it at the time of the previous statement.</span>
+      <span class="c1">// Moreover, modifications to either version aren&#39;t allowed to be</span>
+      <span class="c1">// started. So no modification started on version version_3 between</span>
+      <span class="c1">// the previous statement (when reading was safe), and will not start</span>
+      <span class="c1">// until we unblock writes to version version_3. We can read it</span>
+      <span class="c1">// safely.</span>
+      <span class="n">version_to_read</span> <span class="o">=</span> <span class="n">version_3</span><span class="p">;</span>
+      <span class="c1">// Unblock the *other* version</span>
+      <span class="n">reader_count_</span><span class="p">[</span><span class="mi">1</span> <span class="o">-</span> <span class="n">version_3</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="c1">// We&#39;ve ensured reading is safe at this point.</span>
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">version_to_read</span><span class="p">]);</span>
+
+    <span class="c1">// Unblock the writer from the version we read.</span>
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_to_read</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">version_for_readers_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">i</span><span class="p">);</span>
+      <span class="k">while</span> <span class="p">(</span><span class="n">reader_count_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">load</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+        <span class="c1">// Busy wait</span>
+      <span class="p">}</span>
+      <span class="n">writer_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">version_for_readers_</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">reader_count_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+  <span class="n">T</span> <span class="n">data_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<h3>Exercise</h3>
+<p>Why shouldn't a reader always block writes to both versions before
+checking <code>version_for_readers_</code>, and then unblock the one not in use?</p>
+<h3>Exercise</h3>
+<p>Give a similar strategy that detects writer presence by using the
+<code>lock_word_</code> representation of the reader-writer lock above, and eliminating
+<code>version_for_readers_</code>.</p>
+<h3>Exercise</h3>
+<p>Give a similar strategy that allows readers to block writers by
+writing to a per-reader data structure, which the writer may observe. Note: as a
+consequence, we can see that no atomic compare-and-swap or fetch-and-add or
+other RMW primitives are necessary to implement the interface and progress
+guarantees we sought. This is a rather interesting fact in and of itself.</p>
+<h1>Increasing writer-performance</h1>
+<h2>Lazy updates</h2>
+<p>The careful reader might have noticed that one round of busy looping in the
+<code>write</code> method above could have been avoided: since the writer waits for all the
+readers to leave the second instance before modifying it, on the <em>next</em> call
+to <code>write</code>, there are no readers reading the second instance. So, if the writer
+changed its iteration order to always start on version
+<code>1 - version_for_readers_.load()</code>, the busy wait loop will complete on the first
+iteration.</p>
+<p>We can go a step further, however. Once we've performed the write on one
+instance of the data structure, and indicated to readers that they should begin
+using it, there's no need for the writer to wait for the readers to leave the
+other copy of the data structure, since no new readers are going to use it.
+Instead, we can store the <code>std::function</code> that perform the modification of the
+data structure, and leave the work of actually performing the modification for
+the next writer (note then that the passed in function can't e.g. hold
+references to data on the writing thread's stack unless it is sure it will
+outlive the <code>ReaderWriterData</code>). The next time a write occurs, the writer will
+apply <em>both</em> modifications to the old copy of the data structure, which
+hopefully all the readers will have already left. If the time between <code>write</code>
+calls is longer than the time it takes to perform a read, then the writer will
+never have to wait for readers to leave a version of the data structure.</p>
+<h2>Increased data replication</h2>
+<p>Even using lazy updates, it is still possible for a writer to have to wait for
+readers to leave. This can be particularly problematic if, for instance, the
+number of readers is higher than the number of CPUs allocated to the process. In
+that case, there will always be some reader which is descheduled, probably for a
+time on the order of milliseconds. Since operations on most data structures are
+much faster (on the order of nano- or micro- seconds), this can lead to
+significant writer slowdowns and busy waiting.</p>
+<p>To avoid this, we can increase the number of copies of the data structure we
+keep. If slow readers are stuck on version 0 of the data structure and version 1
+is the current one, then a writer may proceed on version 2 without interfering
+with readers or writers. This doubles the amount of time we allow for read
+operations to take before they begin to block writers. This parameter is
+tunable; we can decrease the odds of the writer blocking, at the cost of
+increasing storage consumption and the number of total data structure
+modifications per logical write.</p>
+<h2>An implementation</h2>
+<p>The combination of the previous two performance improvements causes some amount
+of subtlety; when we have more than two copies of the data structure, which one
+do we update in response to a new write?</p>
+<p>It's clear that we can't modify the most recently updated version (that's the
+one new readers will read from). We could proceed in a round-robin manner, but
+that means that the writer might busy-loop waiting for readers to leave one
+version, even if other versions are empty of readers. We will adopt a
+middle-ground: picking the oldest version of the data structure that does not
+have any readers reading from it. This will require us to explicitly keep track
+of the number of modifications each version of the data structure has undergone,
+and to store as many of the <code>std::function</code>s passed in to <code>write</code> as is necessary
+to bring the oldest version up to date.</p>
+<p>Similarly, with more than 2 copies of the data structure, we can't infer the
+version being written using only the version readers should read. Put another
+way, <code>version_for_readers_</code> in the previous section really served two purposes:</p>
+<ul>
+<li>
+<p>Letting readers know where to read from</p>
+</li>
+<li>
+<p>Warning readers where a write might be happening.</p>
+</li>
+</ul>
+<p>In the 2-version case, the version being written was trivially determinable from
+the version readers were reading, so we could handle this with only one
+variable. In the multiply-replicated case, we'll have to split this variable in
+two: <code>current_version_</code> will be the most up-to-date version of the data
+structure, and tells readers where they should read from, while
+<code>version_being_written_</code> will indicate where a modification might be underway.
+<code>version_being_written_</code> functions as sort of an inversion of the
+"hazard-pointer" technique, if you're familiar with such strategies; it's a way
+for writers to indicate dangers to readers.</p>
+<p>Here is a version of <code>ReaderWriterData</code> with the optimizations described:</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="p">,</span> <span class="kt">int</span> <span class="n">num_versions</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReaderWriterData</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kt">int</span> <span class="n">version_to_read</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+
+    <span class="kt">int</span> <span class="n">version_1</span> <span class="o">=</span> <span class="n">current_version_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_1</span><span class="p">].</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="kt">int</span> <span class="n">written_1</span> <span class="o">=</span> <span class="n">version_being_written_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">version_1</span> <span class="o">!=</span> <span class="n">written_1</span><span class="p">)</span> <span class="p">{</span>
+      <span class="c1">// Great; we blocked new modifications to version version_1, and then</span>
+      <span class="c1">// observed that no in-flight modifications were already happening. We</span>
+      <span class="c1">// can proceed on it.</span>
+      <span class="n">version_to_read</span> <span class="o">=</span> <span class="n">version_1</span><span class="p">;</span>
+    <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+      <span class="c1">// The writer moved on, and started a modification on version</span>
+      <span class="c1">// version_1. That means current_version_ must have changed. Try again</span>
+      <span class="c1">// on that.</span>
+      <span class="kt">int</span> <span class="n">version_2</span> <span class="o">=</span> <span class="n">current_version_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_2</span><span class="p">].</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+      <span class="c1">// Now, new modifications are blocked to versions version_1 and</span>
+      <span class="c1">// version_2. At least one of them is not being modified, and so is</span>
+      <span class="c1">// safe to read from.</span>
+      <span class="kt">int</span> <span class="n">written_2</span> <span class="o">=</span> <span class="n">version_being_written_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="k">if</span> <span class="p">(</span><span class="n">version_2</span> <span class="o">==</span> <span class="n">written_2</span><span class="p">)</span> <span class="p">{</span>
+        <span class="c1">// Have to use version version_1.</span>
+        <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_2</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+        <span class="n">version_to_read</span> <span class="o">=</span> <span class="n">version_1</span><span class="p">;</span>
+      <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+        <span class="c1">// Can use version version_2.</span>
+        <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_1</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+        <span class="n">version_to_read</span> <span class="o">=</span> <span class="n">version_2</span><span class="p">;</span>
+      <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">version_to_read</span><span class="p">]);</span>
+
+    <span class="n">reader_count_</span><span class="p">[</span><span class="n">version_to_read</span><span class="p">].</span><span class="n">fetch_sub</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">in_flight_modifications_</span><span class="p">.</span><span class="n">push_back</span><span class="p">(</span><span class="n">writer_fn</span><span class="p">);</span>
+
+    <span class="kt">int</span> <span class="n">version_to_write</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+    <span class="k">do</span> <span class="p">{</span>
+      <span class="n">version_to_write</span> <span class="o">=</span> <span class="n">oldest_version_with_no_readers</span><span class="p">();</span>
+      <span class="n">version_being_written_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="n">version_to_write</span><span class="p">);</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">reader_count_</span><span class="p">[</span><span class="n">version_to_write</span><span class="p">].</span><span class="n">load</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">);</span>
+
+    <span class="c1">// When we exit the loop, we&#39;ll have warned any possible future readers</span>
+    <span class="c1">// that they should avoid version version_to_write, and then observed</span>
+    <span class="c1">// that no readers are present in that version. Therefore, any future</span>
+    <span class="c1">// readers who try to enter it will observe our write to</span>
+    <span class="c1">// version_being_written_.</span>
+
+    <span class="c1">// Now, apply all necessary pending modifications to version</span>
+    <span class="c1">// version_to_write.</span>
+    <span class="kt">int</span> <span class="n">index_of_first_unapplied_modification</span> <span class="o">=</span>
+        <span class="n">modification_count_</span><span class="p">[</span><span class="n">version_to_write</span><span class="p">]</span> <span class="o">-</span> <span class="n">modification_num_of_front_</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="n">index_of_first_unapplied_modification</span><span class="p">;</span>
+         <span class="n">i</span> <span class="o">&lt;</span> <span class="n">in_flight_modifications_</span><span class="p">.</span><span class="n">size</span><span class="p">();</span>
+         <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">in_flight_modifications_</span><span class="p">[</span><span class="n">i</span><span class="p">](</span><span class="n">data_</span><span class="p">[</span><span class="n">version_to_write</span><span class="p">]);</span>
+      <span class="o">++</span><span class="n">modification_count_</span><span class="p">[</span><span class="n">version_to_write</span><span class="p">];</span>
+    <span class="p">}</span>
+
+    <span class="c1">// Update readers to use the new version.</span>
+    <span class="n">version_being_written_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">);</span>
+    <span class="n">current_version_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="n">version_to_write</span><span class="p">);</span>
+
+    <span class="c1">// Clear out any modifications that have been applied to every version.</span>
+    <span class="kt">int</span> <span class="n">min_modification_count</span> <span class="o">=</span> <span class="n">std</span><span class="o">::</span><span class="n">min_element</span><span class="p">(</span><span class="n">modification_count_</span><span class="p">,</span>
+                                                  <span class="n">modification_count_</span>
+                                                      <span class="o">+</span> <span class="n">num_versions</span><span class="p">);</span>
+    <span class="k">while</span> <span class="p">(</span><span class="n">modification_num_of_front_</span> <span class="o">&lt;</span> <span class="n">min_modification_count</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">in_flight_modifications_</span><span class="p">.</span><span class="n">pop_front</span><span class="p">();</span>
+      <span class="o">++</span><span class="n">modification_num_of_front_</span><span class="p">;</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">array</span><span class="o">&lt;</span><span class="kt">int</span><span class="p">,</span> <span class="n">num_versions</span><span class="o">&gt;</span> <span class="n">versions_ordered_by_age</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">array</span><span class="o">&lt;</span><span class="kt">int</span><span class="p">,</span> <span class="n">num_versions</span><span class="o">&gt;</span> <span class="n">result</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num_versions</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">result</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">i</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">sort</span><span class="p">(</span><span class="n">result</span><span class="p">.</span><span class="n">begin</span><span class="p">(),</span> <span class="n">result</span><span class="p">.</span><span class="n">end</span><span class="p">();</span> <span class="p">[</span><span class="o">&amp;</span><span class="p">](</span><span class="kt">int</span> <span class="n">i1</span><span class="p">,</span> <span class="kt">int</span> <span class="n">i2</span><span class="p">)</span> <span class="p">{</span>
+      <span class="k">return</span> <span class="n">modification_count</span><span class="p">[</span><span class="n">i1</span><span class="p">]</span> <span class="o">&lt;</span> <span class="n">modification_count_</span><span class="p">[</span><span class="n">i2</span><span class="p">];</span>
+    <span class="p">});</span>
+    <span class="k">return</span> <span class="n">result</span><span class="p">;</span>
+  <span class="p">}</span>
+
+  <span class="kt">int</span> <span class="n">oldest_version_with_no_readers</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">array</span><span class="o">&lt;</span><span class="kt">int</span><span class="p">,</span> <span class="n">num_versions</span><span class="o">&gt;</span> <span class="n">versions</span> <span class="o">=</span> <span class="n">versions_ordered_by_age</span><span class="p">();</span>
+    <span class="k">while</span> <span class="p">(</span><span class="nb">true</span><span class="p">)</span> <span class="p">{</span>
+      <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">num_versions</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">versions</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">current_version_</span><span class="p">.</span><span class="n">load</span><span class="p">())</span> <span class="p">{</span>
+          <span class="c1">// Don&#39;t want try to update the current version!</span>
+          <span class="k">continue</span><span class="p">;</span>
+        <span class="p">}</span>
+        <span class="k">if</span> <span class="p">(</span><span class="n">reader_count_</span><span class="p">[</span><span class="n">versions</span><span class="p">[</span><span class="n">i</span><span class="p">]].</span><span class="n">load</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+          <span class="k">return</span> <span class="n">versions</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+        <span class="p">}</span>
+      <span class="p">}</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+  <span class="c1">// The version readers should try to read from</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">current_version_</span><span class="p">;</span>
+
+  <span class="c1">// The version that a writer is currently modifying.</span>
+  <span class="c1">// For simplicity, assume this is initially -1.</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">version_being_written_</span><span class="p">;</span>
+
+  <span class="c1">// All modifications that some version has not yet had applied to it</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">deque</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;&gt;</span> <span class="n">in_flight_modifications_</span><span class="p">;</span>
+
+  <span class="c1">// The modification number of the front of in_flight_modifications_</span>
+  <span class="kt">int</span> <span class="n">modification_num_of_front_</span><span class="p">;</span>
+
+  <span class="c1">// The modification counts of each version</span>
+  <span class="kt">int</span> <span class="n">modification_count_</span><span class="p">[</span><span class="n">num_versions</span><span class="p">];</span>
+
+  <span class="c1">// The number of readers reading each version</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">reader_count_</span><span class="p">[</span><span class="n">num_versions</span><span class="p">];</span>
+
+  <span class="c1">// The versions themselves.</span>
+  <span class="n">T</span> <span class="n">data_</span><span class="p">[</span><span class="n">num_versions</span><span class="p">];</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<h3>Exercise</h3>
+<p>In the last section, there was an exercise to use a per-reader data
+structure instead of atomic fetch-and-adds. Generalize the solution to use the
+optimizations described, using no more than <code>O(num_readers * num_versions)</code>
+atomic integer variables in the helper data structures.</p>
+<h3>Exercise</h3>
+<p>Reduce the space usage from the previous exercise to be only
+<code>O(num_readers + num_versions)</code>.</p>
+<h2>Going to the limit - getting a wait-free writer</h2>
+<p>With the optimizations above, we can reduce wait times for writers
+significantly. This leads us to wonder -- can we reduce them all the way to 0,
+and have a writer that can't be blocked by readers? Perhaps surprisingly, the
+answer is yes, so long as we can bound the number of readers.</p>
+<p>Consider what happens when we set <code>num_versions</code> to <code>2 * num_readers + 2</code>.
+The writer is wait free so long as there is some unblocked version other than
+the current version. Each reader blocks at most 2 versions at a time, so there
+are at most <code>2 * num_readers</code> versions blocked at a time. There are therefore at
+most <code>2 * num_readers + 1</code> versions the writer cannot proceed on, and so there
+is at least one version that the writer <em>can</em> proceed on. All loops in the
+writer will therefore terminate in at most 1 iteration, and the writer is wait
+free.</p>
+<h3>Exercise</h3>
+<p>Come up with a scheme that requires only <code>num_readers + 2</code> copies of a
+data structure to provide wait-freedom.</p>
+<p>Hint: extend the strategy, developed in the previous exercises, of per-reader
+state. Introduce a reader state corresponding to "about to perform a read".
+Readers set their state to "about to perform a read", and then compare and swap
+their state to "reading on version <code>X</code>". Writers try to compare and swap all
+reader states from "about to perform a read" to "reading on version <code>Y</code>" before
+writing to a version other than <code>Y</code>.</p>
+<h1>Possible extensions</h1>
+<p>There are a number of extensions that could be applied to the strategies
+discussed in this post. Two that stand out as being of particular practical
+performance are adding a try-write method, and adopting these techniques to use
+futexes or a similar technique.</p>
+<p>Try-write is straightforward: an attempt to write is made, but the writer does
+not proceed if it might block. This is a straightforward: instead of looping in
+the <code>write</code> method, the writer only tries to write once. If it fails, it returns
+a status indicating that the write did not occur.</p>
+<p>A futex is a scheduling primitive used to efficiently implement mixed
+user-level/kernel-level locking on Linux. Fast-path, contention-free lock
+acquisitions happen entirely in user-space, only entering the kernel in the case
+where a lock is contended, and then blocking, allowing other threads to use the
+CPU time that would otherwise be spent spinning. This mechanism could be used to
+avoid the spinning required by <code>write</code>. The readers would keep a count of the
+number of blocked versions of the data structure, waking up the writer when the
+count becomes nonzero.</p>
+<h1>Notes</h1>
+<p>The reader-preference reader-writer lock is a well-known algorithm due to
+<a href="http://dl.acm.org/citation.cfm?id=109637">Mellor-Crummey and Scott</a>.</p>
+<p>Many of the ideas here a well-known in the garbage collection and database
+literature; in particular:</p>
+<ul>
+<li>
+<p>Maintaining multiple copies of a data structure to allow readers to avoid
+    waiting for writers</p>
+</li>
+<li>
+<p>Maintaining versions with those copies so that writers can proceed while
+    readers are reading from an old version</p>
+</li>
+<li>
+<p>Keeping a log of modifications to the data, which gets applied in batch.</p>
+</li>
+</ul>
+<p>Instead of detailing all of these, I'll note only some of the literature that
+focuses on strategies for in-memory data structures on shared-memory
+multiprocessors with simple version reclamation semantics (i.e. which do not
+require the use of garbage collection).</p>
+<p>The first algorithm that allows for wait-free readers in the presence of a
+writer goes back to <a href="http://dl.acm.org/citation.cfm?id=357198">Peterson</a>, whose
+scheme is also wait-free for the writer. It comes at the cost of maintaining
+<code>num_readers + 2</code> copies of the protected data, which he shows to be both
+necessary and sufficient. His scheme is only applicable to arrays of data which
+allow concurrent reads and writes (a la <code>std::atomic&lt;char&gt;[N]</code>), and requires
+the reader to execute up to 3 physical reads per logical read.</p>
+<p><a href="http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.50.5034">Chen and
+Burns</a> show how
+to use a compare-and-swap primitive to implement a scheme that requires only 1
+read of the data structure per logical read operation, and does not require
+concurrent access to a data structure by both a reader and a writer.
+writer to write to a copy of the data structure concurrently with a reader
+reading from it.  It also uses the theoretical minimum of <code>num_readers + 2</code>
+copies of the data.</p>
+<p><a href="http://concurrencyfreaks.blogspot.com/2013/12/left-right-classical-algorithm.html">Ramalhete and
+Correia</a>
+show how to reduce the number of copies of the data to only 2, at the cost of no
+longer being wait-free for the writer. They provide several variants of their
+technique, which they call the "left-right" algorithm. The two-copy strategy
+presented here is a variant of this algorithm.</p>
+<p>The fetch-and-add based concurrency-control strategy used here is, as far as I
+know, novel, but it is reminiscent of the "Epoch-based reclamation" strategy
+used by <a href="http://www.cl.cam.ac.uk/techreports/UCAM-CL-TR-579.pdf">Fraser</a> to
+provide exclusion between readers and deleters of nodes in lock-free data
+structures. Similarly, I believe the lazy-update scheme and the generalization
+to multiply-replicated data are new, though lazy-updates bears similarity
+to <a href="http://dl.acm.org/citation.cfm?id=1217965">Shalev and Shavit</a>'s Predictive
+Log-Synchronization technique. In the same paper, they present a strategy that
+allows concurrent reads by switching writers between two copies of a data
+structure. Their solution, however, is not wait-free for readers.</p>
+<p>Futexes were introduced to the linux kernel by
+<a href="https://www.kernel.org/doc/ols/2002/ols2002-pages-479-495.pdf">Franke, Russell, and Kirkwood</a>,
+though they bear similarities to BeOS "benaphores".</p>
+    </div><!-- /.entry-content -->
+
+  </article>
+</section>
+        <section id="extras" class="body">
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+                            <li><a href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">atom feed</a></li>
+
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="http://getpelican.com/">Pelican</a>, which takes great advantage of <a href="http://python.org">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="http://coding.smashingmagazine.com/2009/08/04/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+    <script type="text/javascript">
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-64146308-1', 'auto');
+    ga('send', 'pageview');
+    </script>
+</body>
+</html>

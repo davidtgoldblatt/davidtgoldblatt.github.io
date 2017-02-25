@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <title>David Goldblatt's website - multithreading</title>
+        <link rel="stylesheet" href="http://dgoldblatt.com/theme/css/main.css" />
+        <link href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="David Goldblatt's website Atom Feed" />
+
+        <!--[if IE]>
+            <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+        <![endif]-->
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="http://dgoldblatt.com/">David Goldblatt's website </a></h1>
+                <nav><ul>
+                    <li><a href="http://dgoldblatt.com/pages/about.html">About</a></li>
+                    <li><a href="http://dgoldblatt.com/category/blog.html">Blog</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+
+            <aside id="featured" class="body">
+                <article>
+                    <h1 class="entry-title"><a href="http://dgoldblatt.com/a-threading-riddle-solution.html">A threading riddle - Solution</a></h1>
+<footer class="post-info">
+        <abbr class="published" title="2015-06-30T15:20:00-07:00">
+                Published: Tue 30 June 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-06-30T15:20:00-07:00">
+                Updated: Tue 30 June 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info --><h1>Introduction</h1>
+<p>In <a href="http://dgoldblatt.com/a-threading-riddle.html">the last post</a>, we looked at a threading problem
+that requires a some trickiness to solve. In this post, we'll reveal the tricks
+that we need.</p>
+<p>As a recap, we had two functions we set out to implement, that operate on an
+array of size <code>N</code>.</p>
+<ul>
+<li>
+<p><code>void modify(size_t index, int value);</code> This changes the element at position
+  <code>index</code> to equal <code>value</code>.</p>
+</li>
+<li>
+<p><code>void wait_until_equal(size_t index1, size_t index2);</code> This blocks until the
+  elements at positions <code>index1</code> and <code>index2</code> of the array are equal.</p>
+</li>
+</ul>
+<p>We wanted to see how to implement these functions.</p>
+<p>As always, I've thought about this code, but haven't tested it. Given the tricky
+nature of concurrency problems, there's almost certainly bugs, errors, and
+performance gotchas. Think and test carefully before using.</p>
+<h1>Initial data structures</h1>
+<p>Let's start out by looking at the variables required by the problem.</p>
+<div class="highlight"><pre><span></span><span class="k">const</span> <span class="kt">int</span> <span class="n">num_elements</span> <span class="o">=</span> <span class="p">...;</span>
+
+<span class="kt">int</span> <span class="n">array</span><span class="p">[</span><span class="n">num_elements</span><span class="p">];</span>
+
+<span class="kt">void</span> <span class="nf">modify</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">int</span> <span class="n">value</span><span class="p">);</span>
+<span class="kt">void</span> <span class="nf">wait_until_equal</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index1</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">index2</span><span class="p">);</span>
+</pre></div>
+
+
+<p>We want operations on different array indices to acquire different locks, in
+order to allow for as much parallelism as is possible. To accomplish this, let's
+have a per-element lock; <code>mu[i]</code> guards modifications to <code>array[i]</code>.</p>
+<div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span> <span class="n">mu</span><span class="p">[</span><span class="n">num_elements</span><span class="p">];</span>
+</pre></div>
+
+
+<h1>Inspiration</h1>
+<p>With our fundamental data definitions out of the way, we can talk about how to
+solve the problem. To do this, let's look at how we would solve a simpler
+problem. Suppose instead of <code>void wait_until_equal(size_t index1, size_t
+index2)</code>, we had <code>void wait_until_zero(size_t index)</code>, which waits until
+<code>arr[index]</code> is <code>0</code>. Then the problem is easy: we have a condition variable per
+array element, which gets notified on changes to the element. Then we could
+implement the functionality as follows:</p>
+<div class="highlight"><pre><span></span><span class="n">std</span><span class="o">::</span><span class="n">condition_variable</span> <span class="n">cv</span><span class="p">[</span><span class="n">num_elements</span><span class="p">];</span>
+
+<span class="kt">void</span> <span class="nf">modify</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">int</span> <span class="n">value</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu</span><span class="p">[</span><span class="n">index</span><span class="p">]);</span>
+  <span class="n">array</span><span class="p">[</span><span class="n">index</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span><span class="p">;</span>
+  <span class="n">cv</span><span class="p">[</span><span class="n">index</span><span class="p">].</span><span class="n">notify_all</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">wait_until_zero</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">unique_lock</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu_index</span><span class="p">);</span>
+  <span class="k">while</span> <span class="p">(</span><span class="n">array</span><span class="p">[</span><span class="n">index</span><span class="p">]</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">cv</span><span class="p">.</span><span class="n">wait</span><span class="p">(</span><span class="n">lock</span><span class="p">);</span>
+  <span class="p">}</span>
+<span class="p">}</span>
+</pre></div>
+
+
+<h1>An abstraction -- MultiConditionVariable</h1>
+<p>Inspired by <code>wait_until_zero</code>, we might see a solution: if we had a <code>wait</code> that
+could wait on multiple conditions simultaneously, then, in <code>wait_until_equal</code>,
+we could wait for a notification on the condition associated with either of the
+indices we're interested in. We want a <code>MultiConditionVariable</code> that allows
+waiting on multiple conditions at once.</p>
+<p>Let's write out our implementation in terms of this primitive before we see how
+to implement the primitive.</p>
+<div class="highlight"><pre><span></span><span class="n">MultiConditionVariable</span> <span class="n">mcv</span><span class="p">[</span><span class="n">num_elements</span><span class="p">];</span>
+
+<span class="kt">void</span> <span class="nf">modify</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index</span><span class="p">,</span> <span class="kt">int</span> <span class="n">value</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu</span><span class="p">[</span><span class="n">index</span><span class="p">]);</span>
+  <span class="n">array</span><span class="p">[</span><span class="n">index</span><span class="p">]</span> <span class="o">=</span> <span class="n">value</span><span class="p">;</span>
+  <span class="n">mcv</span><span class="p">[</span><span class="n">index</span><span class="p">].</span><span class="n">notify_all</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kt">void</span> <span class="nf">wait_until_equal</span><span class="p">(</span><span class="kt">size_t</span> <span class="n">index1</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">index2</span><span class="p">)</span> <span class="p">{</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">lock</span><span class="p">(</span><span class="n">mu</span><span class="p">[</span><span class="n">index1</span><span class="p">],</span> <span class="n">mu</span><span class="p">[</span><span class="n">index2</span><span class="p">]);</span>
+  <span class="k">while</span> <span class="p">(</span><span class="n">array</span><span class="p">[</span><span class="n">index1</span><span class="p">]</span> <span class="o">!=</span> <span class="n">array</span><span class="p">[</span><span class="n">index2</span><span class="p">])</span> <span class="p">{</span>
+    <span class="n">MultiConditionVariable</span><span class="o">::</span><span class="n">wait</span><span class="p">(</span><span class="n">mcv</span><span class="p">[</span><span class="n">index1</span><span class="p">],</span> <span class="n">mu</span><span class="p">[</span><span class="n">index1</span><span class="p">],</span> <span class="n">mcv</span><span class="p">[</span><span class="n">index2</span><span class="p">],</span> <span class="n">mu</span><span class="p">[</span><span class="n">index2</span><span class="p">]);</span>
+  <span class="p">}</span>
+  <span class="n">mu</span><span class="p">[</span><span class="n">index1</span><span class="p">].</span><span class="n">unlock</span><span class="p">();</span>
+  <span class="n">mu</span><span class="p">[</span><span class="n">index2</span><span class="p">].</span><span class="n">unlock</span><span class="p">();</span>
+<span class="p">}</span>
+</pre></div>
+
+
+<h1>Implementing MultiConditionVariable</h1>
+<p>Now, let's see how to implement the <code>MultiConditionVariable</code> class. First, we'll
+describe its semantics:</p>
+<div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">MultiConditionVariable</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="c1">// Causes the current thread to wait until one of mcv1 or mcv2 is</span>
+  <span class="c1">// notified, atomically releasing mu1 and mu2, or a spurious wakeup</span>
+  <span class="c1">// occurs. Will reacquire mu1 and mu2 before returning.</span>
+  <span class="k">static</span> <span class="kt">void</span> <span class="n">wait</span><span class="p">(</span><span class="n">MultiConditionVariable</span><span class="o">&amp;</span> <span class="n">mcv1</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&amp;</span> <span class="n">mu1</span><span class="p">,</span>
+                   <span class="n">MultiConditionVariable</span><span class="o">&amp;</span> <span class="n">mcv2</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&amp;</span> <span class="n">mu2</span><span class="p">);</span>
+
+  <span class="c1">// Wakes up all threads which are currently waiting on *this. Note that</span>
+  <span class="c1">// such threads will also be waiting on some other MultiConditionVariable</span>
+  <span class="c1">// as well.</span>
+  <span class="kt">void</span> <span class="nf">notify_all</span><span class="p">();</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>How should we implement this class? Here's what we know:</p>
+<ul>
+<li>
+<p>Threads need to go to sleep until woken in <code>wait</code>; we need a way to enable
+  sleeping/waking.</p>
+</li>
+<li>
+<p><code>notify_all</code> needs to know which threads to wake up; there must be a way of
+  keeping track of the set of threads.</p>
+</li>
+<li>
+<p>Because of the previous point, <code>wait</code> needs to inform the
+  <code>MultiConditionVariable</code> that it is sleeping on it, so that it can be later
+  notified.</p>
+</li>
+</ul>
+<h2>A Sleeper</h2>
+<p>The waiting going on is necessarily a little bit tricky; when a thread goes to
+sleep, it can't hold any locks other threads might need to acquire, or else we
+might cause deadlock. But if we don't hold any locks, we might miss the fact
+that the thread should wake up. To fix this, we'll have to use a mutex and a
+condition variable. Let's encapsulate this into a struct:</p>
+<div class="highlight"><pre><span></span><span class="k">struct</span> <span class="n">Sleeper</span> <span class="p">{</span>
+  <span class="kt">void</span> <span class="n">sleep</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">unique_lock</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu</span><span class="p">);</span>
+    <span class="n">cv</span><span class="p">.</span><span class="n">wait</span><span class="p">(</span><span class="n">lock</span><span class="p">,</span> <span class="p">[</span><span class="o">&amp;</span><span class="p">]{</span><span class="k">return</span> <span class="n">awoken</span><span class="p">;})</span>
+    <span class="n">awoken</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">wake</span><span class="p">()</span> <span class="p">{</span>
+    <span class="kt">bool</span> <span class="n">old_awoken</span><span class="p">;</span>
+    <span class="p">{</span>
+      <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu</span><span class="p">);</span>
+      <span class="n">old_awoken</span> <span class="o">=</span> <span class="n">awoken</span><span class="p">;</span>
+      <span class="n">awoken</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+    <span class="p">}</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">old_awoken</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">cv</span><span class="p">.</span><span class="n">notify_one</span><span class="p">();</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+  <span class="kt">bool</span> <span class="n">awoken</span> <span class="o">=</span> <span class="nb">false</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">condition_variable</span> <span class="n">cv</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">mutex</span> <span class="n">mu</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>The way the sleeper works, it can put itself into a list of threads waiting to
+be woken up, release the lock on the list, and then <code>sleep()</code>. If another thread
+acquires the lock on the list, calls <code>wake()</code> to wake up the first thread, and
+then continues, then it doesn't matter if the <code>sleep()</code> or the <code>wake()</code> happens
+first; the thread that <code>sleep()</code>s will continue either way.</p>
+<h2>MultiConditionVariable internals</h2>
+<p>The <code>MultiConditionVariable</code> needs to maintain the set of threads that are
+waiting on it. To do this, we'll use an <code>std::unordered_set</code> of
+pointers-to-<code>Sleeper</code>. Since this set will be accessed concurrently, we'll add
+an <code>std::mutex</code> as well to protect it. The call to <code>wait</code> will create a
+<code>Sleeper</code> and add it to the passed-in <code>MultiConditionVariable</code>s before going to
+sleep. Upon awakening, it removes the <code>Sleeper</code> from the
+<code>MultiConditionVariable</code>s and returns. A call to <code>notify_all</code> simply wakes all
+the threads that are contained in the <code>MultiConditionVariable</code>. Note that races
+in which a thread is added to the <code>MultiConditionVariable</code> when the
+corresponding element of <code>mu</code> isn't held is fine; in the worst case, we get a
+spurious wakeup of the added thread, which is allowed by the
+<code>MultiConditionVariable</code> contract.</p>
+<p>So, here's <code>MultiConditionVariable</code> with an implementation:</p>
+<div class="highlight"><pre><span></span><span class="k">class</span> <span class="nc">MultiConditionVariable</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="k">static</span> <span class="kt">void</span> <span class="n">wait</span><span class="p">(</span><span class="n">MultiConditionVariable</span><span class="o">&amp;</span> <span class="n">mcv1</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&amp;</span> <span class="n">mu1</span><span class="p">,</span>
+                   <span class="n">MultiConditionVariable</span><span class="o">&amp;</span> <span class="n">mcv2</span><span class="p">,</span> <span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&amp;</span> <span class="n">mu2</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">Sleeper</span> <span class="n">sleeper</span><span class="p">;</span>
+    <span class="p">{</span>
+      <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mcv1</span><span class="p">.</span><span class="n">mu</span><span class="p">);</span>
+      <span class="n">mcv1</span><span class="p">.</span><span class="n">sleepers_</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sleeper</span><span class="p">);</span>
+    <span class="p">}</span>
+    <span class="p">{</span>
+      <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mcv1</span><span class="p">.</span><span class="n">mu</span><span class="p">);</span>
+      <span class="n">mcv2</span><span class="p">.</span><span class="n">sleepers_</span><span class="p">.</span><span class="n">insert</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sleeper</span><span class="p">);</span>
+    <span class="p">}</span>
+    <span class="n">mu1</span><span class="p">.</span><span class="n">unlock</span><span class="p">();</span>
+    <span class="n">mu2</span><span class="p">.</span><span class="n">unlock</span><span class="p">();</span>
+
+    <span class="n">sleeper</span><span class="p">.</span><span class="n">sleep</span><span class="p">();</span>
+
+    <span class="p">{</span>
+      <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mcv1</span><span class="p">.</span><span class="n">mu_</span><span class="p">);</span>
+      <span class="n">mcv1</span><span class="p">.</span><span class="n">sleepers_</span><span class="p">.</span><span class="n">erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sleeper</span><span class="p">);</span>
+    <span class="p">}</span>
+    <span class="p">{</span>
+      <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mcv1</span><span class="p">.</span><span class="n">mu_</span><span class="p">);</span>
+      <span class="n">mcv2</span><span class="p">.</span><span class="n">sleepers_</span><span class="p">.</span><span class="n">erase</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sleeper</span><span class="p">);</span>
+    <span class="p">}</span>
+
+    <span class="n">std</span><span class="o">::</span><span class="n">lock</span><span class="p">(</span><span class="n">mu1</span><span class="p">,</span> <span class="n">mu2</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">notify_all</span><span class="p">()</span> <span class="p">{</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">lock_guard</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="o">&gt;</span> <span class="n">lock</span><span class="p">(</span><span class="n">mu_</span><span class="p">);</span>
+    <span class="k">for</span> <span class="p">(</span><span class="n">Sleeper</span><span class="o">*</span> <span class="nl">sleeper</span> <span class="p">:</span> <span class="n">sleepers_</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">sleeper</span><span class="o">-&gt;</span><span class="n">wake</span><span class="p">();</span>
+    <span class="p">}</span>
+    <span class="n">sleepers_</span><span class="p">.</span><span class="n">clear</span><span class="p">();</span>
+  <span class="p">}</span>
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">unordered_set</span><span class="o">&lt;</span><span class="n">Sleeper</span><span class="o">*&gt;</span> <span class="n">sleepers_</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">mutex</span> <span class="n">mu_</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>This gives us the <code>MultiConditionVariable</code> primitive we need, which completes
+the puzzle.</p>
+<h2>Some very slight fixes</h2>
+<p>A particularly eagle-eyed reader might note that we haven't completely satisfied
+the requirements from the previous post. In particular, a call to <code>modify</code> might
+need to wake a sleeping thread that is being woken by a call to <code>modify</code> from
+another thread. This involves acquiring a lock on the <code>Sleeper</code> struct. So, a
+<code>modify</code> call might wait on another call to <code>modify</code> if they each try to wake
+the same thread, breaking the rule that calls to one function shouldn't wait on
+calls to another unless they share an index they operate on.</p>
+<p>We have three avenues to fix this.</p>
+<ul>
+<li>
+<p>Most reasonably, we could simply declare that waiting for a lock in Sleeper
+  shouldn't count as blocking. Waiting for the time it takes to modify a boolean
+  and signal a condition variable is hardly waiting at all.  This works unless
+  you need waking to truly avoid waiting for another thread (say, if you're
+  writing signal-safe code), even in corner-cases.</p>
+</li>
+<li>
+<p>We could implement <code>Sleeper</code> without the mutex/condition variable primitive,
+  relying on OS system call functionality like Linux futexes, or the Windows
+  event primitive.</p>
+</li>
+<li>
+<p>We could use atomics, and <code>compare_exchange_strong</code> a boolean in order to
+  allow one thread to "win" a race and become the designated waker of the
+  sleeping thread. Since all but one of multiple racing calls to <code>wake</code> can
+  safely be ignored (the sleeping thread needs only to be woken once), we can
+  avoid having to acquire a mutex and potentially block.</p>
+</li>
+</ul>
+<h1>Conclusion</h1>
+<p>Just to summarize the steps here: we first implemented <code>modify</code> and
+<code>wait_until_equal</code> by reducing them to a primitive <code>MultiConditionVariable</code>.
+<code>MultiConditionVariable</code> itself relied on a helper <code>Sleeper</code> class, which
+enabled us to explicitly control thread sleeping and waking.</p>
+<p>This problem is trickier than it appears; the extra machinery relative to the
+<code>wait_until_zero</code> variant is substantial. However, it appears to be necessary; I
+haven't been able to find a solution that is fundamentally different than the
+one presented here. All the simpler solutions I've seen involve "tricks" like
+using Software Transactional Memory, which in turn must be built using a
+primitive not unlike <code>MultiConditionVariable</code>. If you've discovered a solution
+that is simpler but does not rely on more powerful primitives, I'd love to hear
+about it.</p>
+<h1>Notes</h1>
+<p>Waiting for one of several conditions to become true is an old trick. It is
+used, for instance, in the Windows <code>WaitForMultipleObjects</code> system call. A
+solution that goes down the same paths as this one is used in Unix ports of the
+Windows threading APIs.</p>
+<p>The <code>Sleeper</code> class is essentially an implementation of the Java <code>LockSupport</code>
+class, which is a low-level API to allow thread sleeping and waiting for use in
+locking primitives.</p>                </article>
+            </aside><!-- /#featured -->
+                <section id="content" class="body">
+                    <h1>Other articles</h1>
+                    <hr />
+                    <ol id="posts-list" class="hfeed">
+
+            <li><article class="hentry">
+                <header>
+                    <h1><a href="http://dgoldblatt.com/a-threading-riddle.html" rel="bookmark"
+                           title="Permalink to A threading riddle">A threading riddle</a></h1>
+                </header>
+
+                <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-06-24T15:20:00-07:00">
+                Published: Wed 24 June 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-06-24T15:20:00-07:00">
+                Updated: Wed 24 June 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->                <p>A tricky problem involving threads waiting for complex conditions to become true</p>
+                <a class="readmore" href="http://dgoldblatt.com/a-threading-riddle.html">read more</a>
+                </div><!-- /.entry-content -->
+            </article></li>
+
+            <li><article class="hentry">
+                <header>
+                    <h1><a href="http://dgoldblatt.com/going-from-lock-free-to-wait-free.html" rel="bookmark"
+                           title="Permalink to Going from lock-free to wait-free">Going from lock-free to wait-free</a></h1>
+                </header>
+
+                <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-05-05T15:20:00-07:00">
+                Published: Tue 05 May 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-05-05T15:20:00-07:00">
+                Updated: Tue 05 May 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/lockfree.html">lockfree</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->                <p>Using further data replication tricks, we can go from lock-free reads to wait-free ones.</p>
+                <a class="readmore" href="http://dgoldblatt.com/going-from-lock-free-to-wait-free.html">read more</a>
+                </div><!-- /.entry-content -->
+            </article></li>
+
+            <li><article class="hentry">
+                <header>
+                    <h1><a href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html" rel="bookmark"
+                           title="Permalink to Lock-free reads through data replication">Lock-free reads through data replication</a></h1>
+                </header>
+
+                <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-04-29T20:30:00-07:00">
+                Published: Wed 29 April 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-04-29T20:30:00-07:00">
+                Updated: Wed 29 April 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/lockfree.html">lockfree</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->                <p>By keeping multiple copies of a data object around, we can allow readers to proceed even while a writer might be blocked mid-write.</p>
+                <a class="readmore" href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html">read more</a>
+                </div><!-- /.entry-content -->
+            </article></li>
+                </ol><!-- /#posts-list -->
+                </section><!-- /#content -->
+        <section id="extras" class="body">
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+                            <li><a href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">atom feed</a></li>
+
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="http://getpelican.com/">Pelican</a>, which takes great advantage of <a href="http://python.org">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="http://coding.smashingmagazine.com/2009/08/04/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+    <script type="text/javascript">
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-64146308-1', 'auto');
+    ga('send', 'pageview');
+    </script>
+</body>
+</html>

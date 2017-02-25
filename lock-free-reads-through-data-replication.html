@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+        <meta charset="utf-8" />
+        <title>Lock-free reads through data replication</title>
+        <link rel="stylesheet" href="http://dgoldblatt.com/theme/css/main.css" />
+        <link href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate" title="David Goldblatt's website Atom Feed" />
+
+        <!--[if IE]>
+            <script src="https://html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+        <![endif]-->
+</head>
+
+<body id="index" class="home">
+        <header id="banner" class="body">
+                <h1><a href="http://dgoldblatt.com/">David Goldblatt's website </a></h1>
+                <nav><ul>
+                    <li><a href="http://dgoldblatt.com/pages/about.html">About</a></li>
+                    <li class="active"><a href="http://dgoldblatt.com/category/blog.html">Blog</a></li>
+                </ul></nav>
+        </header><!-- /#banner -->
+<section id="content" class="body">
+  <article>
+    <header>
+      <h1 class="entry-title">
+        <a href="http://dgoldblatt.com/lock-free-reads-through-data-replication.html" rel="bookmark"
+           title="Permalink to Lock-free reads through data replication">Lock-free reads through data replication</a></h1>
+    </header>
+
+    <div class="entry-content">
+<footer class="post-info">
+        <abbr class="published" title="2015-04-29T20:30:00-07:00">
+                Published: Wed 29 April 2015
+        </abbr>
+		<br />
+        <abbr class="modified" title="2015-04-29T20:30:00-07:00">
+                Updated: Wed 29 April 2015
+        </abbr>
+
+        <address class="vcard author">
+                By                         <a class="url fn" href="http://dgoldblatt.com/author/david-goldblatt.html">David Goldblatt</a>
+        </address>
+<p>In <a href="http://dgoldblatt.com/category/blog.html">Blog</a>.</p>
+<p>tags: <a href="http://dgoldblatt.com/tag/concurrency.html">concurrency</a> <a href="http://dgoldblatt.com/tag/multithreading.html">multithreading</a> <a href="http://dgoldblatt.com/tag/lockfree.html">lockfree</a> <a href="http://dgoldblatt.com/tag/programming.html">programming</a> </p>
+</footer><!-- /.post-info -->      <h1>Introduction</h1>
+<p>Seqlocks and reader-writer locks are two techniques used to control access to
+shared, read-mostly data in multithreaded programs. Briefly, seqlocks work by
+counting modifications to a data structure so that readers can see if a
+modification occurred during their read (so that they know their read was
+hazardous, and they should retry). Reader-writer locks work by allowing
+exclusive access to a data structure to either a single writer, or many readers.</p>
+<p>These approaches share a common problem: a writer that stalls (due to a page fault,
+descheduling, or a long-running computation, for instance) inside a critical
+section can block the readers indefinitely. We'd like to eliminate this
+restriction; to allow readers to continue even while a writer is blocked, even
+if that writer is blocked inside a critical section. That is to say, readers
+should be lock-free with respect to writers. We seek a solution that allows
+readers to continue even if a writer is blocked inside a critical section.</p>
+<p>To accomplish this, we'll keep two copies of our data structure. The writer
+needs to update both copies of the data, one after the other, in order to
+logically complete a write. If the writer blocks, it will be blocked inside an
+update to only one of the copies. The readers can then proceed by reading from
+the other copy, giving us the lock-freedom property we sought.</p>
+<p>For simplicity, we'll consider only the case of a single writer thread (there
+can be  many reader threads). This limitation can be easily removed by adding an
+additional mutex to any data structures we consider, which a writer thread must
+acquire before and release after invoking the functions we describe. I've
+thought hard about the code here but haven't tested it, so be cautious before
+using it.</p>
+<h1>Background</h1>
+<h2>Reader-writer locks</h2>
+<p>Reader-writer locks provide safe access to shared data by changing the control
+flow of threads attempting to access the data. When a writer owns the lock, it
+owns it uniquely, and readers block if they attempt to access it. Alternatively,
+some number of readers may share ownership of the lock; they are then allowed to
+read but not modify the data structure, and any writers block while readers are
+present.</p>
+<p>Reader-writer locks are standardized in C++14 via the <code>std::shared_timed_mutex</code>
+class. Below is a class that encapsulates the protected data and the protection
+mechanism. Readers and the writer pass in a callback function that performs the
+desired operations. For simplicity, we'll ignore things like exception safety.</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReaderWriterLock</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">mu_</span><span class="p">.</span><span class="n">lock_shared</span><span class="p">();</span>
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">);</span>
+    <span class="n">mu_</span><span class="p">.</span><span class="n">unlock_shared</span><span class="p">();</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">mu_</span><span class="p">.</span><span class="n">lock</span><span class="p">();</span>
+    <span class="n">writer_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">);</span>
+    <span class="n">mu_</span><span class="p">.</span><span class="n">unlock</span><span class="p">();</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">shared_timed_mutex</span> <span class="n">mu_</span><span class="p">;</span>
+  <span class="n">T</span> <span class="n">data_</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<h2>Seqlocks</h2>
+<p>RW locks often perform poorly in practice. Readers must update lock metadata in
+order to indicate their presence to a potential future writer. In typical
+implementations, this involves obtaining exclusive write access to the cacheline
+containing the lock, which leads to a cache miss for subsequent readers. Even
+with fast modern memory systems, cache misses can take longer than a short
+critical section, and, what's worse, can be sequentialized in the memory system.
+Updates to the lock itself then become a bottleneck. To avoid this, we'd like a
+concurrency primitive in which readers can be truly read-only. The seqlock is
+one such primitive.</p>
+<p>Seqlocks (short for sequence locks, for reasons which will soon become clear)
+allow readers to access data concurrently with writers. Since readers proceed
+without blocking writers, the readers might see an inconsistent state for the
+protected data (imagine a reader that reads half the protected data before the
+writer modifies it, then half after). The seqlock provides a mechanism to detect
+such a conflict, indicating that the reader should retry.</p>
+<p>Associated with a seqlock is a sequence number. The sequence number starts at 0,
+and is incremented before and after each write. This implies that at any time
+between writes (and therefore, when the data is in a consistent state), the
+sequence number is even, since the number of iniitial increments will equal the
+number of concluding ones. Readers repeatedly read the sequence number, then the
+data structure, then the sequence number again.  If the sequence numbers are
+even (indicating that they weren't read during a writer critical section) and
+equal (indicating that no writer critical section started and finished in
+between the two reads), then the reader can infer that the writer did not
+interfere with its read. Otherwise, the reader should retry.</p>
+<p>The code below encapsulates some seqlock-protected data. Because reads
+and writes may occur on the object simultaneously, we have to represent the
+stored data using <code>std::atomic</code> variables; in turn, this requires that we can
+treat the protected data as trivially copyable. For simplicity, we won't enforce
+this. Similarly, we'll ignore overflow of <code>sequence_number_</code>, use the
+default memory order for all operations (giving sequential consistency), and
+ignore the inevitable reads from an uninitialized <code>data_</code> array.</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">SeqLocked</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">T</span> <span class="n">value</span><span class="p">;</span>
+    <span class="kt">int</span> <span class="n">seq0</span><span class="p">;</span>
+    <span class="kt">int</span> <span class="n">seq1</span><span class="p">;</span>
+    <span class="k">do</span> <span class="p">{</span>
+      <span class="n">seq0</span> <span class="o">=</span> <span class="n">sequence_number_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="n">raw_read_into</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+      <span class="n">seq1</span> <span class="o">=</span> <span class="n">sequence_number_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">seq0</span> <span class="o">!=</span> <span class="n">seq1</span> <span class="o">||</span> <span class="n">seq0</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">==</span> <span class="mi">1</span><span class="p">);</span>
+
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="c1">// Remember: we are assuming there is only one writer;</span>
+    <span class="c1">// this read is safe no matter what.</span>
+    <span class="n">T</span> <span class="n">value</span><span class="p">;</span>
+    <span class="n">raw_read_into</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">writer_fn</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">sequence_number_</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="n">raw_write_from</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">sequence_number_</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">raw_read_into</span><span class="p">(</span><span class="n">T</span><span class="o">&amp;</span> <span class="n">output</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">);</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="o">*</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">output</span> <span class="o">+</span> <span class="n">i</span><span class="p">)</span> <span class="o">=</span> <span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">load</span><span class="p">();</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">raw_write_from</span><span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span> <span class="n">input</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">);</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">store</span><span class="p">(</span><span class="o">*</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">input</span> <span class="o">+</span> <span class="n">i</span><span class="p">));</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">sequence_number_</span><span class="p">;</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">char</span><span class="o">&gt;</span> <span class="n">data_</span><span class="p">[</span><span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">)];</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<h1>The problem: blocked writers</h1>
+<p>Suppose the writer is modifying some of the data protected by a seqlock. It
+increments the sequence number, begins writing to the data, but is preempted by
+the operating system before it completes. Then, all readers are blocked until
+the writer is rescheduled and completes the write. The readers, therefore, are
+not lock-free with respect to the writer. An analogous situation can occur using
+a reader-writer lock.</p>
+<h1>A solution: replicate the data</h1>
+<p>The trick we'll use to solve this problem is old, but not widely known. We'll
+keep two copies of the data being protected. If a writer is blocked midway
+through a write to one copy of the data, the reader can still continue its read
+through the other copy.</p>
+<p>More specifically, a reader will attempt to complete its read on one copy of the
+data. If it succeeds, great; the reader is done. If it fails, it will try to
+read from the other copy of the data. This process repeats until a read attempt
+succeeds. The writer updates one copy of the data structure, and then the other.</p>
+<p>Here is how this technique looks for the reader-writer lock (again, we'll ignore
+trivialities like counter overflow and exceptions):</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="o">&gt;</span>
+<span class="k">class</span> <span class="nc">ReplicatedReaderWriterLock</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kt">int</span> <span class="n">version_to_use</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="k">for</span> <span class="p">(;;</span> <span class="n">version_to_use</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+      <span class="k">if</span> <span class="p">(</span><span class="n">mu_</span><span class="p">[</span><span class="n">version_to_use</span> <span class="o">%</span> <span class="mi">2</span><span class="p">].</span><span class="n">try_lock_shared</span><span class="p">())</span> <span class="p">{</span>
+        <span class="k">break</span><span class="p">;</span>
+      <span class="p">}</span>
+    <span class="p">}</span>
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">version_to_use</span> <span class="o">%</span> <span class="mi">2</span><span class="p">]);</span>
+    <span class="n">mu_</span><span class="p">[</span><span class="n">version_to_use</span> <span class="o">%</span> <span class="mi">2</span><span class="p">].</span><span class="n">unlock_shared</span><span class="p">();</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">;</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">mu_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">lock</span><span class="p">();</span>
+      <span class="n">writer_fn</span><span class="p">(</span><span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+      <span class="n">mu_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">unlock</span><span class="p">();</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">shared_timed_mutex</span> <span class="n">mu_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+  <span class="n">T</span> <span class="n">data_</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<p>Note: the reader-writer variant we present is not technically lock-free in our
+setting; a try_lock_shared call may fail spuriously and return false even if the
+lock is available in C++14. This is a technical detail and can be remedied, but
+we won't do so here; such a problem showing up in practice is vanishingly
+unlikely.</p>
+<h1>Decreasing reader failure rates through further replication</h1>
+<p>The technique in the previous section is enough to provide a form of
+lock-freedom, but readers may still be starved for access if writers continue
+much more quickly than them (a writer modifies both copies of a seqlock'd data
+instance before a reader is able to read one, for instance). Here, we'll
+consider an extension that gives us reduced chances of writer interference, at
+the cost of additional copies of a data structure.</p>
+<p>The key idea is to increase the amount of replication beyond two copies of a
+data object. In order for the writer to block readers, it must update all the
+objects before the reader reads any of them. Increasing the amount of
+replication increases the likelihood of readers succeeding.</p>
+<p>Here's how this looks for the seqlock:</p>
+<div class="highlight"><pre><span></span><span class="k">template</span> <span class="o">&lt;</span><span class="k">typename</span> <span class="n">T</span><span class="p">,</span> <span class="kt">int</span> <span class="n">num_replicas</span><span class="o">&gt;</span>
+<span class="k">struct</span> <span class="n">ReplicatedSeqLocked</span> <span class="p">{</span>
+ <span class="k">public</span><span class="o">:</span>
+  <span class="kt">void</span> <span class="n">read</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">reader_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="n">T</span> <span class="n">value</span><span class="p">;</span>
+    <span class="kt">int</span> <span class="n">seq0</span><span class="p">;</span>
+    <span class="kt">int</span> <span class="n">seq1</span><span class="p">;</span>
+    <span class="k">do</span> <span class="p">{</span>
+      <span class="kt">int</span> <span class="n">version</span> <span class="o">=</span> <span class="n">current_version_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="n">seq0</span> <span class="o">=</span> <span class="n">data_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">sequence_number_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+      <span class="n">data_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">raw_read_into</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+      <span class="n">seq1</span> <span class="o">=</span> <span class="n">data_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">sequence_number_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="p">}</span> <span class="k">while</span> <span class="p">(</span><span class="n">seq0</span> <span class="o">!=</span> <span class="n">seq1</span> <span class="o">||</span> <span class="n">seq0</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">==</span> <span class="mi">1</span><span class="p">);</span>
+
+    <span class="n">reader_fn</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+  <span class="p">}</span>
+
+  <span class="kt">void</span> <span class="n">write</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">function</span><span class="o">&lt;</span><span class="kt">void</span> <span class="p">(</span><span class="n">T</span><span class="o">&amp;</span><span class="p">)</span><span class="o">&gt;</span> <span class="n">writer_fn</span><span class="p">)</span> <span class="p">{</span>
+    <span class="kt">int</span> <span class="n">version</span> <span class="o">=</span> <span class="n">current_version_</span><span class="p">.</span><span class="n">load</span><span class="p">();</span>
+    <span class="kt">int</span> <span class="n">new_version</span> <span class="o">=</span> <span class="p">(</span><span class="n">version</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="n">num_replicas</span><span class="p">;</span>
+    <span class="n">T</span> <span class="n">value</span><span class="p">;</span>
+    <span class="n">data_</span><span class="p">[</span><span class="n">version</span><span class="p">].</span><span class="n">raw_read_into</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">writer_fn</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">data_</span><span class="p">[</span><span class="n">new_version</span><span class="p">].</span><span class="n">sequence_number_</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="n">data_</span><span class="p">[</span><span class="n">new_version</span><span class="p">].</span><span class="n">raw_write_from</span><span class="p">(</span><span class="n">value</span><span class="p">);</span>
+    <span class="n">data_</span><span class="p">[</span><span class="n">new_version</span><span class="p">].</span><span class="n">sequence_number_</span><span class="p">.</span><span class="n">fetch_add</span><span class="p">(</span><span class="mi">1</span><span class="p">);</span>
+    <span class="n">current_version_</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="n">new_version</span><span class="p">);</span>
+  <span class="p">}</span>
+
+ <span class="k">private</span><span class="o">:</span>
+  <span class="k">struct</span> <span class="n">SeqLockData</span> <span class="p">{</span>
+    <span class="kt">void</span> <span class="n">raw_read_into</span><span class="p">(</span><span class="n">T</span><span class="o">&amp;</span> <span class="n">output</span><span class="p">)</span> <span class="p">{</span>
+      <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">);</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+        <span class="o">*</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">output</span> <span class="o">+</span> <span class="n">i</span><span class="p">)</span> <span class="o">=</span> <span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">load</span><span class="p">();</span>
+      <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="kt">void</span> <span class="n">raw_write_from</span><span class="p">(</span><span class="k">const</span> <span class="n">T</span><span class="o">&amp;</span> <span class="n">input</span><span class="p">)</span> <span class="p">{</span>
+      <span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">);</span> <span class="o">++</span><span class="n">i</span><span class="p">)</span> <span class="p">{</span>
+        <span class="n">data_</span><span class="p">[</span><span class="n">i</span><span class="p">].</span><span class="n">store</span><span class="p">(</span><span class="o">*</span><span class="p">((</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="o">&amp;</span><span class="n">input</span> <span class="o">+</span> <span class="n">i</span><span class="p">));</span>
+      <span class="p">}</span>
+    <span class="p">}</span>
+
+    <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">sequence_number_</span><span class="p">;</span>
+    <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">char</span><span class="o">&gt;</span> <span class="n">data_</span><span class="p">[</span><span class="k">sizeof</span><span class="p">(</span><span class="n">T</span><span class="p">)];</span>
+  <span class="p">};</span>
+
+  <span class="n">SeqLockData</span> <span class="n">data_</span><span class="p">[</span><span class="n">num_replicas</span><span class="p">];</span>
+  <span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="kt">int</span><span class="o">&gt;</span> <span class="n">current_version_</span><span class="p">;</span>
+<span class="p">};</span>
+</pre></div>
+
+
+<h1>Some concluding notes on our implementation</h1>
+<p>There are a few differences between the replicated seqlock and replicated
+reader-writer lock.</p>
+<ul>
+<li>
+<p>The seqlock version updates the entire data structure on every modification.
+  The reader-writer one can make small in-place updates. This is a consequence
+  of the API we chose for our implementations, so it could potentially be
+  eliminated, but this would complicate the writer interface (the readers and
+  writers would have to deal with atomic-wrapped data directly, and ask the
+  protecting data structure whether its reads were safe).</p>
+</li>
+<li>
+<p>The converse to this is that the replicated seqlock need only modify one
+  version of the data, whereas a replicated reader-writer lock must modify all
+  copies of the data.</p>
+</li>
+<li>
+<p>An <code>N</code>-replicated reader-writer lock enables another optimization: a thread
+  can hash its thread-id or CPU number to get an index to read from:
+  <code>thread_id % N</code>. This spreads around the contention on lock-metadata,
+  reducing the performance overhead of the lock. In the limit, we have a data
+  instance per CPU, and can avoid all non-local writes in the reader path.</p>
+</li>
+</ul>
+<p>Additionally, note that we could have used a single sequence counter in the
+ReplicatedSeqLock, shared between all data instances. Readers would check it to
+see that the range of modified instances does not include the version that it
+read from. This results in a modest space savings, at the cost of losing some
+simplicity of implementation.</p>
+<h1>Notes</h1>
+<p>Reader-writer locks were introduced by <a href="http://dl.acm.org/citation.cfm?id=362813">Courtois et
+al.</a>,
+and are a well-known synchronization tool.</p>
+<p>Seqlocks were popularized by their introduction into the Linux kernel by <a href="https://lwn.net/Articles/21379/">Stephen
+Hemminger (building on the work of Andrea
+Arcangeli)</a>, but were introduced by
+<a href="http://dl.acm.org/citation.cfm?id=359878">Leslie Lamport</a>, or arguably even earlier, in the
+work of <a href="http://dl.acm.org/citation.cfm?id=806505">William B. Easton</a>. This fact
+is not widely known.</p>
+<p>The idea of using multiple copies of a data structure to improve the blocking 
+properties of readers goes back to
+<a href="http://dl.acm.org/citation.cfm?id=357198">Peterson</a>,
+who introduced a mechanism which is wait-free for the writer as well as readers.
+These ideas were explored most fully by <a href="http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.50.5034">Chen and
+Burns</a>.
+<a href="http://dl.acm.org/citation.cfm?id=1455262">Larsson et al.</a> provide a
+comprehensive survey.
+<a href="http://dl.acm.org/citation.cfm?id=128736">Lamport</a> uses a clever variant of
+a similar idea as well.</p>
+<p>The specific cases of replicating
+data for reader-writer locks and seqlocks is a well-known trick, but I can't
+find a cite for the first use. It is used, for instance, in <a href="http://lxr.free-electrons.com/source/kernel/time/timekeeping.c?v=3.17#L231">the Linux
+kernel</a>,
+and explored by <a href="http://concurrencyfreaks.blogspot.com/2013/11/double-instance-locking.html">Ramalhete and
+Correia</a>
+in what they call "double-instance locking".</p>
+<p>Using <em>more</em> than two copies of a data structure to improve reader seqlock throughput when
+writers are common is a trick from <a href="http://www.1024cores.net/home/lock-free-algorithms/reader-writer-problem/improved-lock-free-seqlock">Dmitry Vyukov</a>.</p>
+    </div><!-- /.entry-content -->
+
+  </article>
+</section>
+        <section id="extras" class="body">
+                <div class="social">
+                        <h2>social</h2>
+                        <ul>
+                            <li><a href="http://dgoldblatt.com/feeds/all.atom.xml" type="application/atom+xml" rel="alternate">atom feed</a></li>
+
+                        </ul>
+                </div><!-- /.social -->
+        </section><!-- /#extras -->
+
+        <footer id="contentinfo" class="body">
+                <address id="about" class="vcard body">
+                Proudly powered by <a href="http://getpelican.com/">Pelican</a>, which takes great advantage of <a href="http://python.org">Python</a>.
+                </address><!-- /#about -->
+
+                <p>The theme is by <a href="http://coding.smashingmagazine.com/2009/08/04/designing-a-html-5-layout-from-scratch/">Smashing Magazine</a>, thanks!</p>
+        </footer><!-- /#contentinfo -->
+
+    <script type="text/javascript">
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','https://www.google-analytics.com/analytics.js','ga');
+
+    ga('create', 'UA-64146308-1', 'auto');
+    ga('send', 'pageview');
+    </script>
+</body>
+</html>
